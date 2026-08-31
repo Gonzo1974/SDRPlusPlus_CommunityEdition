@@ -15,10 +15,15 @@
 #include <utils/freq_formatting.h>
 #include <gui/dialogs/dialog_box.h>
 #include <fstream>
+#include <cstdio>
 #include <optional>
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+
+#ifdef __ANDROID__
+#include <android_backend.h>
+#endif
 
 SDRPP_MOD_INFO{
     /* Name:            */ "frequency_manager",
@@ -1317,8 +1322,15 @@ private:
 
         ImGui::TableSetColumnIndex(0);
         if (ImGui::Button(("Import##_freq_mgr_imp_" + _this->name).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0)) && !_this->importOpen) {
+#ifdef __ANDROID__
+            _this->importOpen = backend::openDocumentPicker();
+            if (!_this->importOpen) {
+                _this->showImportMessage("Import failed.\n\nCould not start the Android document picker.");
+            }
+#else
             _this->importOpen = true;
             _this->importDialog = new pfd::open_file("Import bookmarks", "", { "JSON Files (*.json)", "*.json", "All Files", "*" }, pfd::opt::multiselect);
+#endif
         }
 
         ImGui::TableSetColumnIndex(1);
@@ -1335,6 +1347,12 @@ private:
         }
         if (selectedNames.size() == 0 && _this->selectedListName != "") { style::endDisabled(); }
         ImGui::EndTable();
+
+#ifdef __ANDROID__
+        if (_this->importOpen) {
+            ImGui::TextDisabled("Waiting for Android file selection...");
+        }
+#endif
 
         if (ImGui::Button(("Select displayed lists##_freq_mgr_exp_" + _this->name).c_str(), ImVec2(menuWidth, 0))) {
             _this->selectListsOpen = true;
@@ -1371,6 +1389,42 @@ private:
         }
 
         // Handle import and export
+#ifdef __ANDROID__
+        if (_this->importOpen) {
+            backend::AndroidDocumentPickerStatus status = backend::getDocumentPickerStatus();
+            if (status == backend::AndroidDocumentPickerStatus::SELECTED) {
+                std::string path = backend::consumeDocumentPickerResult();
+                _this->importOpen = false;
+                if (path.empty()) {
+                    _this->showImportMessage("Import failed.\n\nThe Android document picker returned an empty file path.");
+                }
+                else {
+                    FrequencyManagerModule::ImportResult result;
+                    try {
+                        result = _this->importBookmarks(path);
+                    }
+                    catch (const std::exception& e) {
+                        result.error = std::string("An unexpected error occurred while importing: ") + e.what();
+                        flog::error("Frequency Manager: Unexpected import error: {}", e.what());
+                    }
+                    std::remove(path.c_str());
+                    _this->showImportResult(result);
+                }
+            }
+            else if (status == backend::AndroidDocumentPickerStatus::CANCELLED) {
+                backend::consumeDocumentPickerResult();
+                _this->importOpen = false;
+            }
+            else if (status == backend::AndroidDocumentPickerStatus::ERROR) {
+                std::string error = backend::consumeDocumentPickerResult();
+                _this->importOpen = false;
+                if (error.empty()) {
+                    error = "Could not communicate with the Android document picker.";
+                }
+                _this->showImportMessage("Import failed.\n\n" + error);
+            }
+        }
+#else
         if (_this->importOpen && _this->importDialog->ready()) {
             _this->importOpen = false;
             std::vector<std::string> paths = _this->importDialog->result();
@@ -1379,6 +1433,7 @@ private:
             }
             delete _this->importDialog;
         }
+#endif
         if (_this->exportOpen && _this->exportDialog->ready()) {
             _this->exportOpen = false;
             std::string path = _this->exportDialog->result();
@@ -1387,6 +1442,11 @@ private:
             }
             delete _this->exportDialog;
         }
+
+        ImGui::GenericDialog(("Frequency Manager import##_freq_manager_import_result_" + _this->name).c_str(),
+            _this->importMessageOpen, GENERIC_DIALOG_BUTTONS_OK, [_this]() {
+                ImGui::TextWrapped("%s", _this->importMessage.c_str());
+            });
     }
 
     static void fftRedraw(ImGui::WaterFall::FFTRedrawArgs args, void* ctx) {
@@ -1533,49 +1593,134 @@ private:
         ImGui::EndTooltip();
     }
 
+    struct ImportResult {
+        bool success = false;
+        size_t imported = 0;
+        size_t duplicates = 0;
+        size_t invalid = 0;
+        std::string error;
+    };
+
     json exportedBookmarks;
     bool importOpen = false;
     bool exportOpen = false;
-    pfd::open_file* importDialog;
-    pfd::save_file* exportDialog;
+    bool importMessageOpen = false;
+    std::string importMessage;
+    pfd::open_file* importDialog = nullptr;
+    pfd::save_file* exportDialog = nullptr;
 
-    void importBookmarks(std::string path) {
-        std::ifstream fs(path);
-        json importBookmarks;
-        fs >> importBookmarks;
+    void showImportMessage(const std::string& message) {
+        importMessage = message;
+        importMessageOpen = true;
+    }
 
-        if (!importBookmarks.contains("bookmarks")) {
-            flog::error("File does not contains any bookmarks");
+    void showImportResult(const ImportResult& result) {
+        if (!result.success) {
+            showImportMessage("Import failed.\n\n" + result.error);
             return;
         }
 
-        if (!importBookmarks["bookmarks"].is_object()) {
-            flog::error("Bookmark attribute is invalid");
-            return;
+        std::ostringstream message;
+        message << "Imported " << result.imported << " bookmark";
+        if (result.imported != 1) { message << "s"; }
+        message << ".";
+        if (result.duplicates > 0) {
+            message << "\n\nSkipped " << result.duplicates << " duplicate bookmark";
+            if (result.duplicates != 1) { message << "s"; }
+            message << ".";
+        }
+        if (result.invalid > 0) {
+            message << "\n\nSkipped " << result.invalid << " invalid bookmark";
+            if (result.invalid != 1) { message << "s"; }
+            message << ". Check the SDR++ log for details.";
+        }
+        showImportMessage(message.str());
+    }
+
+    ImportResult importBookmarks(const std::string& path) {
+        ImportResult result;
+        std::ifstream fs(path);
+        if (!fs.is_open()) {
+            result.error = "The selected file could not be opened.";
+            flog::error("Frequency Manager: Could not open import file '{}'", path);
+            return result;
+        }
+
+        json importedData;
+        try {
+            fs >> importedData;
+        }
+        catch (const std::exception& e) {
+            result.error = std::string("The selected file is not valid JSON: ") + e.what();
+            flog::error("Frequency Manager: Could not parse import file '{}': {}", path, e.what());
+            return result;
+        }
+
+        if (!importedData.is_object() || !importedData.contains("bookmarks")) {
+            result.error = "The selected file does not contain a 'bookmarks' object.";
+            flog::error("Frequency Manager: Import file does not contain bookmarks");
+            return result;
+        }
+
+        if (!importedData["bookmarks"].is_object()) {
+            result.error = "The 'bookmarks' value in the selected file is invalid.";
+            flog::error("Frequency Manager: Import file has an invalid bookmarks value");
+            return result;
         }
 
         // Load every bookmark using efficient deserialization
-        for (auto const [_name, bm] : importBookmarks["bookmarks"].items()) {
+        for (auto const& item : importedData["bookmarks"].items()) {
+            const std::string& _name = item.key();
+            const json& bm = item.value();
             if (bookmarks.find(_name) != bookmarks.end()) {
                 flog::warn("Bookmark with the name '{0}' already exists in list, skipping", _name);
+                result.duplicates++;
                 continue;
             }
-            // Use performance-optimized deserialization
-            FrequencyBookmark fbm = FrequencyBookmark::fromJson(bm);
-            fbm.selected = false;
-            
-            // Validate bookmark before adding
-            if (!fbm.isValid()) {
-                flog::warn("Invalid bookmark '{0}' skipped during import", _name);
-                continue;
-            }
-            
-            bookmarks[_name] = fbm;
-        }
-        saveByName(selectedListName);
-        markScanListDirty();  // PERFORMANCE: Immediate scanner update
 
-        fs.close();
+            try {
+                if (!bm.is_object()) {
+                    flog::warn("Invalid bookmark '{0}' skipped during import", _name);
+                    result.invalid++;
+                    continue;
+                }
+
+                // Use performance-optimized deserialization
+                FrequencyBookmark fbm = FrequencyBookmark::fromJson(bm);
+                fbm.selected = false;
+
+                // Validate bookmark before adding
+#ifdef __ANDROID__
+                // A Windows export must not be rejected because Android currently uses
+                // a lower SDR sample rate; hardware state must not decide data import.
+                bool validForImport = fbm.isBand
+                    ? (fbm.startFreq < fbm.endFreq && fbm.stepFreq > 0.0 &&
+                        fbm.stepFreq <= (fbm.endFreq - fbm.startFreq))
+                    : (fbm.frequency > 0.0);
+#else
+                bool validForImport = fbm.isValid();
+#endif
+                if (!validForImport) {
+                    flog::warn("Invalid bookmark '{0}' skipped during import", _name);
+                    result.invalid++;
+                    continue;
+                }
+
+                bookmarks[_name] = fbm;
+                result.imported++;
+            }
+            catch (const std::exception& e) {
+                flog::warn("Invalid bookmark '{}': {}", _name, e.what());
+                result.invalid++;
+            }
+        }
+
+        if (result.imported > 0) {
+            saveByName(selectedListName);
+            markScanListDirty();  // PERFORMANCE: Immediate scanner update
+        }
+        result.success = true;
+        return result;
     }
 
     void exportBookmarks(std::string path) {

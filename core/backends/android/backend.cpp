@@ -10,6 +10,7 @@
 #include <android/asset_manager.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
+#include <jni.h>
 #include <stdint.h>
 #include <gui/icons.h>
 #include <gui/style.h>
@@ -32,6 +33,35 @@ namespace backend {
     // Forward declaration
     int ShowSoftKeyboardInput();
     int PollUnicodeChars();
+
+    namespace {
+        JNIEnv* acquireJavaEnvironment(bool& detachWhenDone) {
+            detachWhenDone = false;
+            if (!app || !app->activity || !app->activity->vm) { return nullptr; }
+
+            JNIEnv* env = nullptr;
+            JavaVM* javaVm = app->activity->vm;
+            jint result = javaVm->GetEnv((void**)&env, JNI_VERSION_1_6);
+            if (result == JNI_OK) { return env; }
+            if (result != JNI_EDETACHED) { return nullptr; }
+            if (javaVm->AttachCurrentThread(&env, nullptr) != JNI_OK) { return nullptr; }
+
+            detachWhenDone = true;
+            return env;
+        }
+
+        void releaseJavaEnvironment(bool detachWhenDone) {
+            if (detachWhenDone && app && app->activity && app->activity->vm) {
+                app->activity->vm->DetachCurrentThread();
+            }
+        }
+
+        bool clearJavaException(JNIEnv* env) {
+            if (!env || !env->ExceptionCheck()) { return false; }
+            env->ExceptionClear();
+            return true;
+        }
+    }
 
     void doPartialInit() {
         std::string root = (std::string)core::args["root"];
@@ -358,6 +388,81 @@ namespace backend {
             return -5;
 
         return 0;
+    }
+
+    bool openDocumentPicker() {
+        bool detachWhenDone = false;
+        JNIEnv* env = acquireJavaEnvironment(detachWhenDone);
+        if (!env) { return false; }
+
+        bool opened = false;
+        jclass activityClass = env->GetObjectClass(app->activity->clazz);
+        if (activityClass) {
+            jmethodID method = env->GetMethodID(activityClass, "openDocumentPicker", "()Z");
+            if (method) {
+                opened = env->CallBooleanMethod(app->activity->clazz, method) == JNI_TRUE;
+            }
+            env->DeleteLocalRef(activityClass);
+        }
+
+        if (clearJavaException(env)) { opened = false; }
+        releaseJavaEnvironment(detachWhenDone);
+        return opened;
+    }
+
+    AndroidDocumentPickerStatus getDocumentPickerStatus() {
+        bool detachWhenDone = false;
+        JNIEnv* env = acquireJavaEnvironment(detachWhenDone);
+        if (!env) { return AndroidDocumentPickerStatus::ERROR; }
+
+        jint status = (jint)AndroidDocumentPickerStatus::ERROR;
+        jclass activityClass = env->GetObjectClass(app->activity->clazz);
+        if (activityClass) {
+            jmethodID method = env->GetMethodID(activityClass, "getDocumentPickerStatus", "()I");
+            if (method) {
+                status = env->CallIntMethod(app->activity->clazz, method);
+            }
+            env->DeleteLocalRef(activityClass);
+        }
+
+        if (clearJavaException(env)) {
+            status = (jint)AndroidDocumentPickerStatus::ERROR;
+        }
+        releaseJavaEnvironment(detachWhenDone);
+
+        if (status < (jint)AndroidDocumentPickerStatus::IDLE ||
+            status > (jint)AndroidDocumentPickerStatus::ERROR) {
+            return AndroidDocumentPickerStatus::ERROR;
+        }
+        return (AndroidDocumentPickerStatus)status;
+    }
+
+    std::string consumeDocumentPickerResult() {
+        bool detachWhenDone = false;
+        JNIEnv* env = acquireJavaEnvironment(detachWhenDone);
+        if (!env) { return ""; }
+
+        std::string result;
+        jclass activityClass = env->GetObjectClass(app->activity->clazz);
+        if (activityClass) {
+            jmethodID method = env->GetMethodID(activityClass, "consumeDocumentPickerResult", "()Ljava/lang/String;");
+            if (method) {
+                jstring javaResult = (jstring)env->CallObjectMethod(app->activity->clazz, method);
+                if (javaResult && !env->ExceptionCheck()) {
+                    const char* chars = env->GetStringUTFChars(javaResult, nullptr);
+                    if (chars) {
+                        result = chars;
+                        env->ReleaseStringUTFChars(javaResult, chars);
+                    }
+                    env->DeleteLocalRef(javaResult);
+                }
+            }
+            env->DeleteLocalRef(activityClass);
+        }
+
+        if (clearJavaException(env)) { result.clear(); }
+        releaseJavaEnvironment(detachWhenDone);
+        return result;
     }
 
     std::string getAppFilesDir() {

@@ -26,6 +26,12 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.io.*;
 
 private const val ACTION_USB_PERMISSION = "org.sdrpp.sdrpp.USB_PERMISSION";
+private const val DOCUMENT_PICKER_REQUEST = 0x5344;
+private const val DOCUMENT_PICKER_IDLE = 0;
+private const val DOCUMENT_PICKER_PENDING = 1;
+private const val DOCUMENT_PICKER_SELECTED = 2;
+private const val DOCUMENT_PICKER_CANCELLED = 3;
+private const val DOCUMENT_PICKER_ERROR = 4;
 
 private val usbReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -60,6 +66,10 @@ class MainActivity : NativeActivity() {
     public var SDR_VID : Int = -1;
     public var SDR_PID : Int = -1;
     public var SDR_FD : Int = -1;
+
+    private val documentPickerLock = Any();
+    private var documentPickerStatus : Int = DOCUMENT_PICKER_IDLE;
+    private var documentPickerResult : String = "";
 
     fun checkAndAsk(permission: String) {
         if (PermissionChecker.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
@@ -105,6 +115,116 @@ class MainActivity : NativeActivity() {
         // Hide bars again
         hideSystemBars();
         super.onResume();
+    }
+
+    // Called from native code. The Storage Access Framework returns a content:// URI,
+    // which is copied to app cache so the existing C++ file parser can remain unchanged.
+    fun openDocumentPicker(): Boolean {
+        var stalePath = "";
+        synchronized(documentPickerLock) {
+            if (documentPickerStatus == DOCUMENT_PICKER_PENDING) {
+                return false;
+            }
+            if (documentPickerStatus == DOCUMENT_PICKER_SELECTED) {
+                stalePath = documentPickerResult;
+            }
+            documentPickerStatus = DOCUMENT_PICKER_PENDING;
+            documentPickerResult = "";
+        }
+
+        if (stalePath.isNotEmpty()) {
+            File(stalePath).delete();
+        }
+
+        runOnUiThread {
+            try {
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE);
+                    type = "*/*";
+                    putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                        "application/json",
+                        "text/json",
+                        "text/plain",
+                        "application/octet-stream"
+                    ));
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                }
+                startActivityForResult(intent, DOCUMENT_PICKER_REQUEST);
+            }
+            catch (e: Exception) {
+                setDocumentPickerError("Could not open the Android file picker: " +
+                    (e.message ?: e.javaClass.simpleName));
+            }
+        }
+        return true;
+    }
+
+    fun getDocumentPickerStatus(): Int {
+        synchronized(documentPickerLock) {
+            return documentPickerStatus;
+        }
+    }
+
+    fun consumeDocumentPickerResult(): String {
+        synchronized(documentPickerLock) {
+            val result = documentPickerResult;
+            documentPickerStatus = DOCUMENT_PICKER_IDLE;
+            documentPickerResult = "";
+            return result;
+        }
+    }
+
+    private fun setDocumentPickerError(message: String) {
+        synchronized(documentPickerLock) {
+            documentPickerStatus = DOCUMENT_PICKER_ERROR;
+            documentPickerResult = message;
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != DOCUMENT_PICKER_REQUEST) {
+            return;
+        }
+
+        hideSystemBars();
+        if (resultCode != RESULT_OK) {
+            synchronized(documentPickerLock) {
+                documentPickerStatus = DOCUMENT_PICKER_CANCELLED;
+                documentPickerResult = "";
+            }
+            return;
+        }
+
+        val uri = data?.data;
+        if (uri == null) {
+            setDocumentPickerError("The Android file picker did not return a document.");
+            return;
+        }
+
+        Thread {
+            var temporaryFile : File? = null;
+            try {
+                val targetFile = File.createTempFile("frequency_manager_import_", ".json", cacheDir);
+                temporaryFile = targetFile;
+                val input = contentResolver.openInputStream(uri)
+                    ?: throw IOException("The selected document could not be opened.");
+                input.use { source ->
+                    FileOutputStream(targetFile).use { destination ->
+                        source.copyTo(destination);
+                    }
+                }
+                synchronized(documentPickerLock) {
+                    documentPickerStatus = DOCUMENT_PICKER_SELECTED;
+                    documentPickerResult = targetFile.absolutePath;
+                }
+            }
+            catch (e: Exception) {
+                temporaryFile?.delete();
+                setDocumentPickerError("Could not read the selected document: " +
+                    (e.message ?: e.javaClass.simpleName));
+            }
+        }.start();
     }
 
     fun showSoftInput() {

@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #include <vector>
 #include <stdint.h>
 
@@ -14,4 +15,16 @@ namespace backend {
     extern const std::vector<DevVIDPID> RTL_SDR_VIDPIDS;
 
     int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids);
+
+    enum class AndroidDocumentPickerStatus : int {
+        IDLE = 0,
+        PENDING = 1,
+        SELECTED = 2,
+        CANCELLED = 3,
+        ERROR = 4
+    };
+
+    bool openDocumentPicker();
+    AndroidDocumentPickerStatus getDocumentPickerStatus();
+    std::string consumeDocumentPickerResult();
 }
