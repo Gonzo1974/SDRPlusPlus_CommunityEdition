@@ -82,6 +82,23 @@ namespace {
         float peakMax = NO_DATA_DBFS;
     };
 
+    struct SegmentDebugStats {
+        int segmentNumber = 0;
+        std::size_t rawFftBinCount = 0;
+        std::size_t validRawBins = 0;
+        std::size_t rejectedZeroBins = 0;
+        std::size_t rejectedNonFiniteBins = 0;
+        std::size_t rejectedOutOfRangeBins = 0;
+        std::size_t wideBinsWritten = 0;
+        std::size_t accumulatedUniqueWideBins = 0;
+        std::size_t wideBinsTotal = WIDE_BIN_COUNT;
+        float coveragePercent = 0.0f;
+        double rawStartHz = 0.0;
+        double rawStopHz = 0.0;
+        double usableStartHz = 0.0;
+        double usableStopHz = 0.0;
+    };
+
     enum class PendingTuneReason {
         NONE,
         RESTORE_AFTER_STOP,
@@ -356,6 +373,7 @@ private:
             activeSegmentStepHz = activeUsableBandwidthHz * (1.0 - (overlapPercent / 100.0));
             currentSegment = 0;
             segmentCount = 0;
+            currentSegmentDebugStats = {};
         }
         sweepRequested.store(true);
         requestCv.notify_all();
@@ -455,6 +473,8 @@ private:
         }
 
         while (sweepRequested.load() && !shuttingDown.load()) {
+            // These buffers live for the entire sweep. Segments only merge into
+            // them; neither buffer is reset inside the segment loop.
             std::vector<float> cycleSpectrum(WIDE_BIN_COUNT, NO_DATA_DBFS);
             std::vector<float> cycleQuality(WIDE_BIN_COUNT, -1.0f);
             SpectrumDebugStats cycleDebugStats;
@@ -479,8 +499,11 @@ private:
                     break;
                 }
 
+                SegmentDebugStats segmentDebugStats;
+                segmentDebugStats.segmentNumber = static_cast<int>(segmentIndex) + 1;
                 std::vector<float> averagedFFT;
-                if (!captureAveragedFFT(settings.fftAveraging, averagedFFT, cycleDebugStats)) {
+                if (!captureAveragedFFT(settings.fftAveraging, averagedFFT, cycleDebugStats,
+                                        segmentDebugStats)) {
                     if (!sweepRequested.load() || shuttingDown.load()) {
                         break;
                     }
@@ -488,10 +511,20 @@ private:
                     return;
                 }
 
-                mergeSegment(settings, centerHz, averagedFFT, cycleSpectrum, cycleQuality);
+                segmentDebugStats.wideBinsWritten = mergeSegment(
+                    settings, centerHz, averagedFFT, cycleSpectrum, cycleQuality, segmentDebugStats);
+                segmentDebugStats.accumulatedUniqueWideBins = static_cast<std::size_t>(std::count_if(
+                    cycleSpectrum.begin(), cycleSpectrum.end(), [](float value) { return isValidDbfs(value); }));
+                segmentDebugStats.wideBinsTotal = cycleSpectrum.size();
+                if (segmentDebugStats.wideBinsTotal > 0) {
+                    segmentDebugStats.coveragePercent =
+                        100.0f * static_cast<float>(segmentDebugStats.accumulatedUniqueWideBins) /
+                        static_cast<float>(segmentDebugStats.wideBinsTotal);
+                }
                 capturedAnySegment = true;
                 {
                     std::lock_guard<std::mutex> lock(displayMutex);
+                    currentSegmentDebugStats = segmentDebugStats;
                     statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
                 }
             }
@@ -549,9 +582,12 @@ private:
     }
 
     bool captureAveragedFFT(int requestedFrames, std::vector<float>& averagedFFT,
-                            SpectrumDebugStats& debugStats) {
+                            SpectrumDebugStats& debugStats, SegmentDebugStats& segmentDebugStats) {
         std::vector<double> sums;
         std::vector<unsigned int> validCounts;
+        std::vector<unsigned char> sawZero;
+        std::vector<unsigned char> sawNonFinite;
+        std::vector<unsigned char> sawOutOfRange;
         int capturedFrames = 0;
         int attempts = 0;
         const int maxAttempts = requestedFrames + 5;
@@ -576,16 +612,31 @@ private:
             if (sums.empty()) {
                 sums.assign(fftSize, 0.0);
                 validCounts.assign(fftSize, 0);
+                sawZero.assign(fftSize, 0);
+                sawNonFinite.assign(fftSize, 0);
+                sawOutOfRange.assign(fftSize, 0);
             }
             if (static_cast<int>(sums.size()) != fftSize) {
                 sums.clear();
                 validCounts.clear();
+                sawZero.clear();
+                sawNonFinite.clear();
+                sawOutOfRange.clear();
                 capturedFrames = 0;
                 continue;
             }
 
             for (int i = 0; i < fftSize; ++i) {
                 const float value = fftData[i];
+                if (!std::isfinite(value)) {
+                    sawNonFinite[i] = 1;
+                }
+                else if (value > GRAPH_MAX_DB || value < MIN_VALID_FFT_DB) {
+                    sawOutOfRange[i] = 1;
+                }
+                else if (value == 0.0f) {
+                    sawZero[i] = 1;
+                }
                 if (!validateFFTDbfs(value, debugStats)) {
                     continue;
                 }
@@ -604,65 +655,90 @@ private:
             averagedFFT[i] = validCounts[i] > 0
                                  ? static_cast<float>(sums[i] / static_cast<double>(validCounts[i]))
                                  : NO_DATA_DBFS;
+            if (validCounts[i] > 0) {
+                ++segmentDebugStats.validRawBins;
+            }
+            else {
+                segmentDebugStats.rejectedZeroBins += sawZero[i] != 0;
+                segmentDebugStats.rejectedNonFiniteBins += sawNonFinite[i] != 0;
+                segmentDebugStats.rejectedOutOfRangeBins += sawOutOfRange[i] != 0;
+            }
         }
+        segmentDebugStats.rawFftBinCount = averagedFFT.size();
         return true;
     }
 
-    void mergeSegment(const SweepSettings& settings, double centerHz, const std::vector<float>& fft,
-                      std::vector<float>& output, std::vector<float>& quality) const {
+    std::size_t mergeSegment(const SweepSettings& settings, double centerHz, const std::vector<float>& fft,
+                             std::vector<float>& output, std::vector<float>& quality,
+                             SegmentDebugStats& segmentDebugStats) const {
         if (fft.size() < 2 || output.empty() || output.size() != quality.size()) {
-            return;
+            return 0;
         }
 
         const double range = settings.stopHz - settings.startHz;
         const double usableBandwidth = settings.sampleRateHz * USABLE_BANDWIDTH_RATIO;
         const double usableHalf = usableBandwidth * 0.5;
         const double rawStartHz = centerHz - (settings.sampleRateHz * 0.5);
+        const double rawStopHz = centerHz + (settings.sampleRateHz * 0.5);
         const double usableStartHz = centerHz - usableHalf;
         const double usableStopHz = centerHz + usableHalf;
+        const double effectiveUsableStartHz = std::max(settings.startHz, usableStartHz);
+        const double effectiveUsableStopHz = std::min(settings.stopHz, usableStopHz);
+        const double rawBinWidthHz = settings.sampleRateHz / static_cast<double>(fft.size());
         const double wideBinWidthHz = range / static_cast<double>(output.size());
-        const double fftSize = static_cast<double>(fft.size());
 
-        for (std::size_t i = 0; i < output.size(); ++i) {
-            const double frequencyHz = settings.startHz + ((static_cast<double>(i) + 0.5) * range / output.size());
-            if (frequencyHz < usableStartHz || frequencyHz > usableStopHz) {
+        segmentDebugStats.rawStartHz = rawStartHz;
+        segmentDebugStats.rawStopHz = rawStopHz;
+        segmentDebugStats.usableStartHz = effectiveUsableStartHz;
+        segmentDebugStats.usableStopHz = effectiveUsableStopHz;
+
+        // Project every valid raw FFT bin exactly once. A wide bin is much wider
+        // than a raw bin, so every raw bin landing in it participates in the max
+        // reduction instead of relying on rounded, output-driven index ranges.
+        std::vector<float> segmentSpectrum(output.size(), NO_DATA_DBFS);
+        for (std::size_t rawIndex = 0; rawIndex < fft.size(); ++rawIndex) {
+            const float candidate = fft[rawIndex];
+            if (!isValidDbfs(candidate)) {
                 continue;
             }
 
-            const float segmentQuality = static_cast<float>(1.0 - (std::abs(frequencyHz - centerHz) / usableHalf));
-            if (segmentQuality <= quality[i]) {
+            const double frequencyHz = rawStartHz +
+                                       ((static_cast<double>(rawIndex) + 0.5) * rawBinWidthHz);
+            if (frequencyHz < effectiveUsableStartHz || frequencyHz >= effectiveUsableStopHz) {
                 continue;
             }
 
-            const double binStartHz = settings.startHz + (static_cast<double>(i) * wideBinWidthHz);
-            const double binStopHz = binStartHz + wideBinWidthHz;
-            const double wideStartHz = std::max(binStartHz, usableStartHz);
-            const double wideStopHz = std::min(binStopHz, usableStopHz);
-            if (wideStopHz <= wideStartHz) {
+            const double widePosition = (frequencyHz - settings.startHz) / wideBinWidthHz;
+            if (widePosition < 0.0 || widePosition >= static_cast<double>(output.size())) {
                 continue;
             }
-
-            const double rawBegin = ((wideStartHz - rawStartHz) / settings.sampleRateHz) * fftSize;
-            const double rawEnd = ((wideStopHz - rawStartHz) / settings.sampleRateHz) * fftSize;
-            const std::size_t first = static_cast<std::size_t>(
-                std::clamp(std::floor(rawBegin), 0.0, fftSize - 1.0));
-            const std::size_t lastExclusive = static_cast<std::size_t>(
-                std::clamp(std::ceil(rawEnd), static_cast<double>(first + 1), fftSize));
-
-            float level = NO_DATA_DBFS;
-            for (std::size_t rawIndex = first; rawIndex < lastExclusive; ++rawIndex) {
-                const float candidate = fft[rawIndex];
-                if (isValidDbfs(candidate) && (!std::isfinite(level) || candidate > level)) {
-                    level = candidate;
-                }
+            const std::size_t wideIndex = static_cast<std::size_t>(std::floor(widePosition));
+            float& segmentLevel = segmentSpectrum[wideIndex];
+            if (!std::isfinite(segmentLevel) || candidate > segmentLevel) {
+                segmentLevel = candidate;
             }
-            if (!std::isfinite(level)) {
-                continue;
-            }
-
-            output[i] = level;
-            quality[i] = segmentQuality;
         }
+
+        std::size_t writtenBins = 0;
+        for (std::size_t wideIndex = 0; wideIndex < output.size(); ++wideIndex) {
+            const float level = segmentSpectrum[wideIndex];
+            if (!isValidDbfs(level)) {
+                continue;
+            }
+
+            const double frequencyHz = settings.startHz +
+                                       ((static_cast<double>(wideIndex) + 0.5) * wideBinWidthHz);
+            const float segmentQuality = static_cast<float>(
+                1.0 - (std::abs(frequencyHz - centerHz) / usableHalf));
+            if (segmentQuality <= quality[wideIndex]) {
+                continue;
+            }
+
+            output[wideIndex] = level;
+            quality[wideIndex] = segmentQuality;
+            ++writtenBins;
+        }
+        return writtenBins;
     }
 
     void publishSweep(const SweepSettings& settings, std::vector<float> spectrum, double sweepSeconds,
@@ -973,6 +1049,7 @@ private:
         double usableBandwidthHz = 0.0;
         double segmentStepHz = 0.0;
         SpectrumDebugStats debugStats;
+        SegmentDebugStats segmentDebugStats;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             segment = currentSegment;
@@ -985,6 +1062,7 @@ private:
             usableBandwidthHz = activeUsableBandwidthHz;
             segmentStepHz = activeSegmentStepHz;
             debugStats = lastDebugStats;
+            segmentDebugStats = currentSegmentDebugStats;
         }
 
         ImGui::Text("Worker active: %s", workerActive.load() ? "yes" : "no");
@@ -996,6 +1074,21 @@ private:
         ImGui::Text("Sample rate: %.3f MS/s", sampleRateHz / 1e6);
         ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
         ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
+        ImGui::Separator();
+        ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
+        ImGui::Text("Raw FFT bin count: %zu", segmentDebugStats.rawFftBinCount);
+        ImGui::Text("Valid raw bins: %zu", segmentDebugStats.validRawBins);
+        ImGui::Text("Rejected zero bins: %zu", segmentDebugStats.rejectedZeroBins);
+        ImGui::Text("Rejected non-finite bins: %zu", segmentDebugStats.rejectedNonFiniteBins);
+        ImGui::Text("Rejected out-of-range bins: %zu", segmentDebugStats.rejectedOutOfRangeBins);
+        ImGui::Text("Current segment wide bins written: %zu", segmentDebugStats.wideBinsWritten);
+        ImGui::Text("Accumulated unique wide bins: %zu", segmentDebugStats.accumulatedUniqueWideBins);
+        ImGui::Text("Coverage: %.1f%%", segmentDebugStats.coveragePercent);
+        ImGui::Text("Wide bins total: %zu", segmentDebugStats.wideBinsTotal);
+        ImGui::Text("Raw FFT frequency start/end: %.6f / %.6f MHz",
+                    segmentDebugStats.rawStartHz / 1e6, segmentDebugStats.rawStopHz / 1e6);
+        ImGui::Text("Effective usable start/end: %.6f / %.6f MHz",
+                    segmentDebugStats.usableStartHz / 1e6, segmentDebugStats.usableStopHz / 1e6);
         ImGui::Separator();
         ImGui::Text("FFT values: already dBFS (no additional conversion)");
         drawDebugRange("FFT raw min/max", debugStats.rawMin, debugStats.rawMax);
@@ -1063,6 +1156,7 @@ private:
     double lastSweepSeconds = 0.0;
     double sweepsPerMinute = 0.0;
     SpectrumDebugStats lastDebugStats;
+    SegmentDebugStats currentSegmentDebugStats;
 
     double returnFrequencyHz = 0.0;
     double pendingTuneHz = 0.0;
