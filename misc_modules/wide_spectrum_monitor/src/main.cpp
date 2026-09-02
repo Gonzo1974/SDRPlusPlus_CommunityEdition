@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <mutex>
@@ -16,6 +17,10 @@
 
 #include <config.h>
 #include <core.h>
+#include <dsp/sink/handler_sink.h>
+#include <dsp/stream.h>
+#include <dsp/window/nuttall.h>
+#include <fftw3.h>
 #include <gui/gui.h>
 #include <gui/style.h>
 #include <gui/tuner.h>
@@ -23,6 +28,7 @@
 #include <module.h>
 #include <signal_path/signal_path.h>
 #include <utils/flog.h>
+#include <volk/volk.h>
 
 SDRPP_MOD_INFO{
     /* Name:            */ "wide_spectrum_monitor",
@@ -36,14 +42,19 @@ ConfigManager config;
 
 namespace {
     constexpr int WIDE_BIN_COUNT = 2048;
+    constexpr int DIRECT_FFT_SIZE = 65536;
+    constexpr double DIRECT_FFT_RATE = 20.0;
+    constexpr int MIN_IQ_CAPTURE_TIMEOUT_MS = 2000;
     constexpr std::size_t MAX_SEGMENT_COUNT = 4096;
     constexpr double USABLE_BANDWIDTH_RATIO = 0.85;
-    constexpr int FFT_FRAME_WAIT_MS = 55;
     constexpr float GRAPH_MIN_DB = -120.0f;
     constexpr float GRAPH_MAX_DB = 0.0f;
     constexpr float MIN_VALID_FFT_DB = -200.0f;
     constexpr float MIN_VALID_SWEEP_PERCENT = 95.0f;
     const float NO_DATA_DBFS = std::numeric_limits<float>::quiet_NaN();
+
+    // Producer FFT diagnostics (V8) is intentionally retired for this module.
+    // V9 owns its IQ capture and FFT buffers instead of observing the GUI waterfall.
 
     struct SweepSettings {
         double startHz = 225000000.0;
@@ -136,6 +147,9 @@ namespace {
         double rawStopHz = 0.0;
         double usableStartHz = 0.0;
         double usableStopHz = 0.0;
+        std::size_t iqSamplesPerFrame = 0;
+        std::uint64_t firstIQFrameGeneration = 0;
+        std::uint64_t lastIQFrameGeneration = 0;
         RawFFTDistribution rawDistribution;
     };
 
@@ -177,9 +191,8 @@ namespace {
             ++stats.invalidSamples;
             return false;
         }
-        // WaterFall::setRawFFTSize clears its raw storage to exactly zero. A real
-        // FFT bin may approach full scale, but an exact 0.0 dBFS value is also the
-        // reset/default sentinel and must not become a persistent wide-band spike.
+        // Preserve the V3 validation rule: an exact 0.0 dBFS value is treated as
+        // invalid so it can never become a persistent full-scale wide-band spike.
         if (value == 0.0f) {
             ++stats.zeroDefaultSamples;
             ++stats.invalidSamples;
@@ -187,8 +200,8 @@ namespace {
         }
 
         ++stats.validSamples;
-        // acquireRawFFT already contains dBFS from IQFrontEnd's VOLK power-spectrum
-        // conversion. "After conversion" is therefore intentionally the same value.
+        // The private VOLK power-spectrum output is already logarithmic power.
+        // "After conversion" is therefore intentionally the same value.
         includeInRange(value, stats.convertedMin, stats.convertedMax);
         return true;
     }
@@ -310,6 +323,19 @@ public:
     explicit WideSpectrumMonitorModule(std::string instanceName) : name(std::move(instanceName)) {
         loadConfig();
 
+        if (initializeDirectFFT()) {
+            iqCaptureBuffer.reserve(DIRECT_FFT_SIZE);
+            iqSink.init(&iqStream, iqStreamHandler, this);
+            iqSink.start();
+            sigpath::iqFrontEnd.bindIQStream(&iqStream);
+            iqStreamBound = true;
+        }
+        else {
+            statusText = "FFT initialization failed";
+            lastError = "Could not initialize the private Wide Spectrum Monitor FFT";
+            flog::error("Wide Spectrum Monitor: {}", lastError);
+        }
+
         playStateHandler.ctx = this;
         playStateHandler.handler = playStateChanged;
         gui::mainWindow.onPlayStateChange.bindHandler(&playStateHandler);
@@ -331,9 +357,16 @@ public:
         sweepRequested.store(false);
         shuttingDown.store(true);
         requestCv.notify_all();
+        iqCaptureCv.notify_all();
         if (workerThread.joinable()) {
             workerThread.join();
         }
+        if (iqStreamBound) {
+            sigpath::iqFrontEnd.unbindIQStream(&iqStream);
+            iqSink.stop();
+            iqStreamBound = false;
+        }
+        releaseDirectFFT();
         gui::menu.removeEntry(name);
     }
 
@@ -360,6 +393,73 @@ private:
     static void playStateChanged(bool playing, void* ctx) {
         if (!playing) {
             static_cast<WideSpectrumMonitorModule*>(ctx)->requestStop("Stopped (SDR source is not running)");
+        }
+    }
+
+    static void iqStreamHandler(dsp::complex_t* data, int count, void* ctx) {
+        if (!data || count <= 0) {
+            return;
+        }
+
+        auto* instance = static_cast<WideSpectrumMonitorModule*>(ctx);
+        std::unique_lock<std::mutex> lock(instance->iqCaptureMutex);
+        if (!instance->iqCaptureRequested || instance->shuttingDown.load()) {
+            return;
+        }
+
+        // A stream buffer can already be waiting when the worker requests a
+        // capture. Drop that complete chunk so every retained sample is newer
+        // than the post-tune capture request.
+        if (instance->discardNextIQChunk) {
+            instance->discardNextIQChunk = false;
+            return;
+        }
+
+        const std::size_t available = static_cast<std::size_t>(count);
+        const std::size_t needed = instance->iqCaptureTarget - instance->iqCaptureBuffer.size();
+        const std::size_t copyCount = std::min(available, needed);
+        instance->iqCaptureBuffer.insert(instance->iqCaptureBuffer.end(), data, data + copyCount);
+        if (instance->iqCaptureBuffer.size() != instance->iqCaptureTarget) {
+            return;
+        }
+
+        instance->iqCaptureRequested = false;
+        ++instance->iqFrameGeneration;
+        lock.unlock();
+        instance->iqCaptureCv.notify_all();
+    }
+
+    bool initializeDirectFFT() {
+        directFFTIn = static_cast<fftwf_complex*>(
+            fftwf_malloc(sizeof(fftwf_complex) * DIRECT_FFT_SIZE));
+        directFFTOut = static_cast<fftwf_complex*>(
+            fftwf_malloc(sizeof(fftwf_complex) * DIRECT_FFT_SIZE));
+        if (!directFFTIn || !directFFTOut) {
+            releaseDirectFFT();
+            return false;
+        }
+
+        directFFTPlan = fftwf_plan_dft_1d(DIRECT_FFT_SIZE, directFFTIn, directFFTOut,
+                                          FFTW_FORWARD, FFTW_ESTIMATE);
+        if (!directFFTPlan) {
+            releaseDirectFFT();
+            return false;
+        }
+        return true;
+    }
+
+    void releaseDirectFFT() {
+        if (directFFTPlan) {
+            fftwf_destroy_plan(directFFTPlan);
+            directFFTPlan = nullptr;
+        }
+        if (directFFTIn) {
+            fftwf_free(directFFTIn);
+            directFFTIn = nullptr;
+        }
+        if (directFFTOut) {
+            fftwf_free(directFFTOut);
+            directFFTOut = nullptr;
         }
     }
 
@@ -472,6 +572,10 @@ private:
         sanitizeControls();
         saveConfig();
 
+        if (!iqStreamBound || !directFFTPlan) {
+            setError("The private IQ/FFT path is unavailable");
+            return;
+        }
         if (!workerThread.joinable()) {
             setError("Sweep worker is unavailable");
             return;
@@ -531,6 +635,7 @@ private:
     void requestStop(const std::string& status) {
         const bool wasRequested = sweepRequested.exchange(false);
         requestCv.notify_all();
+        iqCaptureCv.notify_all();
         if (wasRequested || workerActive.load()) {
             std::lock_guard<std::mutex> lock(displayMutex);
             statusText = status;
@@ -570,6 +675,7 @@ private:
     void setError(const std::string& error) {
         sweepRequested.store(false);
         requestCv.notify_all();
+        iqCaptureCv.notify_all();
         std::lock_guard<std::mutex> lock(displayMutex);
         lastError = error;
         statusText = "Stopped";
@@ -601,7 +707,6 @@ private:
                 setError("Sweep worker failed with an unknown error");
             }
             workerActive.store(false);
-
         }
         workerActive.store(false);
     }
@@ -649,8 +754,8 @@ private:
                 SegmentDebugStats segmentDebugStats;
                 segmentDebugStats.segmentNumber = static_cast<int>(segmentIndex) + 1;
                 std::vector<float> averagedFFT;
-                if (!captureAveragedFFT(settings.fftAveraging, averagedFFT, cycleDebugStats,
-                                        segmentDebugStats)) {
+                if (!captureAveragedFFT(settings.fftAveraging, settings.sampleRateHz,
+                                        averagedFFT, cycleDebugStats, segmentDebugStats)) {
                     if (!sweepRequested.load() || shuttingDown.load()) {
                         break;
                     }
@@ -685,7 +790,8 @@ private:
             }
 
             const double sweepSeconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - sweepStartedAt).count();
+                                            std::chrono::steady_clock::now() - sweepStartedAt)
+                                            .count();
             publishSweep(settings, std::move(cycleSpectrum), sweepSeconds, cycleDebugStats);
         }
     }
@@ -705,7 +811,7 @@ private:
             return {};
         }
         if (range <= usableBandwidth) {
-            return {(settings.startHz + settings.stopHz) * 0.5};
+            return { (settings.startHz + settings.stopHz) * 0.5 };
         }
 
         const double step = usableBandwidth * (1.0 - (settings.overlapPercent / 100.0));
@@ -728,57 +834,116 @@ private:
         return centers;
     }
 
-    bool captureAveragedFFT(int requestedFrames, std::vector<float>& averagedFFT,
-                            SpectrumDebugStats& debugStats, SegmentDebugStats& segmentDebugStats) {
-        std::vector<double> sums;
-        std::vector<unsigned int> validCounts;
-        std::vector<unsigned char> sawZero;
-        std::vector<unsigned char> sawNonFinite;
-        std::vector<unsigned char> sawOutOfRange;
-        int capturedFrames = 0;
-        int attempts = 0;
-        const int maxAttempts = requestedFrames + 5;
+    bool captureIQFrame(std::size_t sampleCount, double sampleRateHz,
+                        std::vector<dsp::complex_t>& samples,
+                        std::uint64_t& generation) {
+        if (!iqStreamBound || sampleCount < 2 || sampleCount > DIRECT_FFT_SIZE ||
+            !std::isfinite(sampleRateHz) || sampleRateHz <= 0.0) {
+            return false;
+        }
 
-        while (capturedFrames < requestedFrames && attempts < maxAttempts) {
-            if (attempts > 0 && !waitFor(std::chrono::milliseconds(FFT_FRAME_WAIT_MS))) {
+        const double captureMilliseconds =
+            (1000.0 * static_cast<double>(sampleCount)) / sampleRateHz;
+        const int timeoutMs = std::max(
+            MIN_IQ_CAPTURE_TIMEOUT_MS,
+            static_cast<int>(std::ceil((captureMilliseconds * 4.0) + 500.0)));
+
+        std::unique_lock<std::mutex> lock(iqCaptureMutex);
+        iqCaptureBuffer.clear();
+        iqCaptureTarget = sampleCount;
+        discardNextIQChunk = true;
+        const std::uint64_t requestedGeneration = iqFrameGeneration + 1;
+        iqCaptureRequested = true;
+
+        const bool signaled = iqCaptureCv.wait_for(
+            lock, std::chrono::milliseconds(timeoutMs), [this, requestedGeneration]() {
+                return iqFrameGeneration >= requestedGeneration || shuttingDown.load() ||
+                       !sweepRequested.load();
+            });
+        if (!signaled || iqFrameGeneration < requestedGeneration ||
+            shuttingDown.load() || !sweepRequested.load()) {
+            iqCaptureRequested = false;
+            discardNextIQChunk = false;
+            iqCaptureTarget = 0;
+            iqCaptureBuffer.clear();
+            return false;
+        }
+
+        samples = iqCaptureBuffer;
+        generation = iqFrameGeneration;
+        iqCaptureTarget = 0;
+        return samples.size() == sampleCount;
+    }
+
+    bool computeDirectFFT(const std::vector<dsp::complex_t>& samples,
+                          std::vector<float>& fftDbfs) {
+        if (!directFFTPlan || !directFFTIn || !directFFTOut || samples.size() < 2 ||
+            samples.size() > DIRECT_FFT_SIZE) {
+            return false;
+        }
+
+        if (directFFTWindow.size() != samples.size()) {
+            directFFTWindow.resize(samples.size());
+            for (std::size_t i = 0; i < samples.size(); ++i) {
+                const float shift = (i % 2) ? -1.0f : 1.0f;
+                directFFTWindow[i] = static_cast<float>(
+                                         dsp::window::nuttall(static_cast<double>(i),
+                                                              static_cast<double>(samples.size()))) *
+                                     shift;
+            }
+        }
+
+        std::memset(directFFTIn, 0, sizeof(fftwf_complex) * DIRECT_FFT_SIZE);
+        volk_32fc_32f_multiply_32fc(
+            reinterpret_cast<lv_32fc_t*>(directFFTIn),
+            reinterpret_cast<const lv_32fc_t*>(samples.data()), directFFTWindow.data(),
+            static_cast<unsigned int>(samples.size()));
+        fftwf_execute(directFFTPlan);
+
+        fftDbfs.resize(DIRECT_FFT_SIZE);
+        volk_32fc_s32f_power_spectrum_32f(
+            fftDbfs.data(), reinterpret_cast<const lv_32fc_t*>(directFFTOut),
+            static_cast<float>(DIRECT_FFT_SIZE), DIRECT_FFT_SIZE);
+        return true;
+    }
+
+    bool captureAveragedFFT(int requestedFrames, double sampleRateHz,
+                            std::vector<float>& averagedFFT,
+                            SpectrumDebugStats& debugStats,
+                            SegmentDebugStats& segmentDebugStats) {
+        const long long intervalSamples = std::llround(sampleRateHz / DIRECT_FFT_RATE);
+        const std::size_t iqSamplesPerFrame = static_cast<std::size_t>(
+            std::clamp<long long>(intervalSamples, 2, DIRECT_FFT_SIZE));
+        segmentDebugStats.iqSamplesPerFrame = iqSamplesPerFrame;
+
+        std::vector<double> sums(DIRECT_FFT_SIZE, 0.0);
+        std::vector<unsigned int> validCounts(DIRECT_FFT_SIZE, 0);
+        std::vector<unsigned char> sawZero(DIRECT_FFT_SIZE, 0);
+        std::vector<unsigned char> sawNonFinite(DIRECT_FFT_SIZE, 0);
+        std::vector<unsigned char> sawOutOfRange(DIRECT_FFT_SIZE, 0);
+
+        for (int capturedFrames = 0; capturedFrames < requestedFrames; ++capturedFrames) {
+            std::vector<dsp::complex_t> iqSamples;
+            std::uint64_t generation = 0;
+            if (!captureIQFrame(iqSamplesPerFrame, sampleRateHz, iqSamples, generation)) {
                 return false;
             }
-            ++attempts;
 
-            int fftSize = 0;
-            float* fftData = gui::waterfall.acquireRawFFT(fftSize);
-            if (!fftData || fftSize <= 0) {
-                continue;
+            std::vector<float> fftData;
+            if (!computeDirectFFT(iqSamples, fftData) || fftData.size() != DIRECT_FFT_SIZE) {
+                return false;
             }
-            struct RawFFTRelease {
-                ~RawFFTRelease() {
-                    gui::waterfall.releaseRawFFT();
-                }
-            } rawFFTRelease;
 
-            if (sums.empty()) {
-                sums.assign(fftSize, 0.0);
-                validCounts.assign(fftSize, 0);
-                sawZero.assign(fftSize, 0);
-                sawNonFinite.assign(fftSize, 0);
-                sawOutOfRange.assign(fftSize, 0);
+            if (segmentDebugStats.firstIQFrameGeneration == 0) {
+                segmentDebugStats.firstIQFrameGeneration = generation;
             }
-            if (static_cast<int>(sums.size()) != fftSize) {
-                sums.clear();
-                validCounts.clear();
-                sawZero.clear();
-                sawNonFinite.clear();
-                sawOutOfRange.clear();
-                capturedFrames = 0;
-                continue;
-            }
+            segmentDebugStats.lastIQFrameGeneration = generation;
 
             RawFFTDistribution frameDistribution;
-            frameDistribution.totalBins = static_cast<std::size_t>(fftSize);
-            for (int i = 0; i < fftSize; ++i) {
+            frameDistribution.totalBins = fftData.size();
+            for (std::size_t i = 0; i < fftData.size(); ++i) {
                 const float value = fftData[i];
-                recordRawFFTValue(value, static_cast<std::size_t>(i),
-                                  static_cast<std::size_t>(fftSize), frameDistribution);
+                recordRawFFTValue(value, i, fftData.size(), frameDistribution);
                 if (!std::isfinite(value)) {
                     sawNonFinite[i] = 1;
                 }
@@ -794,27 +959,23 @@ private:
                 sums[i] += value;
                 ++validCounts[i];
             }
+
             const std::size_t sampleIndices[RawFFTDistribution::SAMPLE_COUNT] = {
                 0,
                 1,
-                static_cast<std::size_t>(fftSize) / 8,
-                static_cast<std::size_t>(fftSize) / 4,
-                static_cast<std::size_t>(fftSize) / 2,
-                (static_cast<std::size_t>(fftSize) * 3) / 4,
-                (static_cast<std::size_t>(fftSize) * 7) / 8,
-                static_cast<std::size_t>(fftSize) - 2,
-                static_cast<std::size_t>(fftSize) - 1
+                fftData.size() / 8,
+                fftData.size() / 4,
+                fftData.size() / 2,
+                (fftData.size() * 3) / 4,
+                (fftData.size() * 7) / 8,
+                fftData.size() - 2,
+                fftData.size() - 1
             };
             for (std::size_t sample = 0; sample < RawFFTDistribution::SAMPLE_COUNT; ++sample) {
                 frameDistribution.sampleIndices[sample] = sampleIndices[sample];
                 frameDistribution.sampleValues[sample] = fftData[sampleIndices[sample]];
             }
             segmentDebugStats.rawDistribution = frameDistribution;
-            ++capturedFrames;
-        }
-
-        if (capturedFrames == 0 || sums.empty()) {
-            return false;
         }
 
         averagedFFT.resize(sums.size());
@@ -994,7 +1155,7 @@ private:
             if (level < settings.thresholdDbfs || level < spectrum[i - 1] || level <= spectrum[i + 1]) {
                 continue;
             }
-            candidates.push_back({settings.startHz + ((static_cast<double>(i) + 0.5) * binWidthHz), level});
+            candidates.push_back({ settings.startHz + ((static_cast<double>(i) + 0.5) * binWidthHz), level });
         }
 
         std::sort(candidates.begin(), candidates.end(), [](const DetectedPeak& lhs, const DetectedPeak& rhs) {
@@ -1242,9 +1403,14 @@ private:
         ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
         ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
         ImGui::Separator();
+        ImGui::TextUnformatted("FFT source: private bound IQFrontEnd stream (V9)");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
-        ImGui::Text("Raw FFT bin count: %zu", segmentDebugStats.rawFftBinCount);
-        ImGui::Text("Valid raw bins: %zu", segmentDebugStats.validRawBins);
+        ImGui::Text("Direct FFT bin count: %zu", segmentDebugStats.rawFftBinCount);
+        ImGui::Text("IQ samples per FFT frame: %zu", segmentDebugStats.iqSamplesPerFrame);
+        ImGui::Text("IQ frame generation first/last: %llu / %llu",
+                    static_cast<unsigned long long>(segmentDebugStats.firstIQFrameGeneration),
+                    static_cast<unsigned long long>(segmentDebugStats.lastIQFrameGeneration));
+        ImGui::Text("Valid direct FFT bins: %zu", segmentDebugStats.validRawBins);
         ImGui::Text("Rejected zero bins: %zu", segmentDebugStats.rejectedZeroBins);
         ImGui::Text("Rejected non-finite bins: %zu", segmentDebugStats.rejectedNonFiniteBins);
         ImGui::Text("Rejected out-of-range bins: %zu", segmentDebugStats.rejectedOutOfRangeBins);
@@ -1258,7 +1424,7 @@ private:
                     segmentDebugStats.usableStartHz / 1e6, segmentDebugStats.usableStopHz / 1e6);
         drawRawFFTDistribution(segmentDebugStats.rawDistribution);
         ImGui::Separator();
-        ImGui::Text("FFT values: already dBFS (no additional conversion)");
+        ImGui::Text("FFT values: direct VOLK logarithmic power (no additional conversion)");
         drawDebugRange("FFT raw min/max", debugStats.rawMin, debugStats.rawMax);
         drawDebugRange("FFT dBFS min/max", debugStats.convertedMin, debugStats.convertedMax);
         ImGui::Text("Valid FFT samples: %llu", static_cast<unsigned long long>(debugStats.validSamples));
@@ -1294,7 +1460,7 @@ private:
     }
 
     static void drawRawFFTDistribution(const RawFFTDistribution& distribution) {
-        if (!ImGui::CollapsingHeader("Raw FFT distribution before validation",
+        if (!ImGui::CollapsingHeader("Direct FFT distribution before validation",
                                      ImGuiTreeNodeFlags_DefaultOpen)) {
             return;
         }
@@ -1302,11 +1468,11 @@ private:
         ImGui::Text("Expected format: logarithmic power (dBFS-like), not linear magnitude");
         ImGui::Text("Distribution frame bins: %zu", distribution.totalBins);
         if (std::isfinite(distribution.finiteMin) && std::isfinite(distribution.finiteMax)) {
-            ImGui::Text("Raw finite min/max: %.9g / %.9g", distribution.finiteMin,
+            ImGui::Text("Direct finite min/max: %.9g / %.9g", distribution.finiteMin,
                         distribution.finiteMax);
         }
         else {
-            ImGui::TextUnformatted("Raw finite min/max: no finite data");
+            ImGui::TextUnformatted("Direct finite min/max: no finite data");
         }
 
         drawRawCount("Finite", distribution.finiteBins, distribution.totalBins);
@@ -1320,7 +1486,7 @@ private:
         drawRawCount("-Inf", distribution.negativeInfBins, distribution.totalBins);
 
         ImGui::Separator();
-        ImGui::TextUnformatted("Value histogram (one raw frame)");
+        ImGui::TextUnformatted("Value histogram (one private FFT frame)");
         drawRawCount("< -200", distribution.belowMinus200Bins, distribution.totalBins);
         drawRawCount("[-200, -160)", distribution.minus200ToMinus160Bins, distribution.totalBins);
         drawRawCount("[-160, -120)", distribution.minus160ToMinus120Bins, distribution.totalBins);
@@ -1353,7 +1519,7 @@ private:
         }
 
         ImGui::Separator();
-        ImGui::TextUnformatted("Fixed-index raw samples");
+        ImGui::TextUnformatted("Fixed-index direct FFT samples");
         for (std::size_t sample = 0; sample < RawFFTDistribution::SAMPLE_COUNT; ++sample) {
             ImGui::Text("[%zu] = %.9g", distribution.sampleIndices[sample],
                         distribution.sampleValues[sample]);
@@ -1371,13 +1537,29 @@ private:
     float thresholdDbfs = -55.0f;
     bool peakHoldEnabled = true;
 
-    std::atomic<bool> shuttingDown{false};
-    std::atomic<bool> sweepRequested{false};
-    std::atomic<bool> workerActive{false};
+    std::atomic<bool> shuttingDown{ false };
+    std::atomic<bool> sweepRequested{ false };
+    std::atomic<bool> workerActive{ false };
     std::thread workerThread;
     std::mutex requestMutex;
     std::condition_variable requestCv;
     SweepSettings queuedSettings;
+
+    dsp::stream<dsp::complex_t> iqStream;
+    dsp::sink::Handler<dsp::complex_t> iqSink;
+    bool iqStreamBound = false;
+    std::mutex iqCaptureMutex;
+    std::condition_variable iqCaptureCv;
+    std::vector<dsp::complex_t> iqCaptureBuffer;
+    std::size_t iqCaptureTarget = 0;
+    bool iqCaptureRequested = false;
+    bool discardNextIQChunk = false;
+    std::uint64_t iqFrameGeneration = 0;
+
+    fftwf_complex* directFFTIn = nullptr;
+    fftwf_complex* directFFTOut = nullptr;
+    fftwf_plan directFFTPlan = nullptr;
+    std::vector<float> directFFTWindow;
 
     std::mutex displayMutex;
     std::vector<float> completedSweep;
