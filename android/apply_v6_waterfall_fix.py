@@ -17,9 +17,9 @@ elif old in text:
 else:
     raise SystemExit("Could not find expected WaterFall::onResize() lock block; refusing to patch")
 
-# V7 producer-level FFT diagnostics are applied in the same Android build step,
-# so the existing GitHub Actions workflow does not need another dedicated step.
-v7 = Path(__file__).with_name("apply_v7_fft_diagnostics.py")
-if not v7.exists():
-    raise SystemExit("V7 diagnostics patch script is missing")
-runpy.run_path(str(v7), run_name="__main__")
+# V8 replaces the V7 producer diagnostics. V8 keeps diagnostics in file-scope
+# storage in iq_frontend.cpp and does not change the IQFrontEnd object layout.
+v8 = Path(__file__).with_name("apply_v8_fft_diagnostics.py")
+if not v8.exists():
+    raise SystemExit("V8 diagnostics patch script is missing")
+runpy.run_path(str(v8), run_name="__main__")
