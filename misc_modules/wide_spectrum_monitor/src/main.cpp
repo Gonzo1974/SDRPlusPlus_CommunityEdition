@@ -82,6 +82,45 @@ namespace {
         float peakMax = NO_DATA_DBFS;
     };
 
+    struct RawFFTDistribution {
+        static constexpr std::size_t SAMPLE_COUNT = 9;
+
+        std::size_t totalBins = 0;
+        std::size_t finiteBins = 0;
+        std::size_t negativeFiniteBins = 0;
+        std::size_t positiveFiniteBins = 0;
+        std::size_t exactZeroBins = 0;
+        std::size_t negativeZeroBins = 0;
+        std::size_t subnormalBins = 0;
+        std::size_t nanBins = 0;
+        std::size_t positiveInfBins = 0;
+        std::size_t negativeInfBins = 0;
+        std::size_t belowMinus200Bins = 0;
+        std::size_t minus200ToMinus160Bins = 0;
+        std::size_t minus160ToMinus120Bins = 0;
+        std::size_t minus120ToMinus100Bins = 0;
+        std::size_t minus100ToMinus80Bins = 0;
+        std::size_t minus80ToMinus60Bins = 0;
+        std::size_t minus60ToMinus40Bins = 0;
+        std::size_t minus40ToMinus20Bins = 0;
+        std::size_t minus20ToZeroBins = 0;
+        std::size_t zeroToOneBins = 0;
+        std::size_t oneTo100Bins = 0;
+        std::size_t above100Bins = 0;
+        std::size_t firstNonZeroBin = std::numeric_limits<std::size_t>::max();
+        std::size_t lastNonZeroBin = 0;
+        std::size_t currentZeroRun = 0;
+        std::size_t longestZeroRun = 0;
+        std::size_t quartileValidBins[4] = {};
+        std::size_t quartileZeroBins[4] = {};
+        std::size_t quartileNonFiniteBins[4] = {};
+        std::size_t quartileOutOfRangeBins[4] = {};
+        std::size_t sampleIndices[SAMPLE_COUNT] = {};
+        float sampleValues[SAMPLE_COUNT] = {};
+        float finiteMin = NO_DATA_DBFS;
+        float finiteMax = NO_DATA_DBFS;
+    };
+
     struct SegmentDebugStats {
         int segmentNumber = 0;
         std::size_t rawFftBinCount = 0;
@@ -97,6 +136,7 @@ namespace {
         double rawStopHz = 0.0;
         double usableStartHz = 0.0;
         double usableStopHz = 0.0;
+        RawFFTDistribution rawDistribution;
     };
 
     enum class PendingTuneReason {
@@ -155,6 +195,113 @@ namespace {
 
     bool isValidDbfs(float value) {
         return std::isfinite(value) && value >= MIN_VALID_FFT_DB && value < GRAPH_MAX_DB;
+    }
+
+    void recordRawFFTValue(float value, std::size_t index, std::size_t totalBins,
+                           RawFFTDistribution& distribution) {
+        if (totalBins == 0) {
+            return;
+        }
+
+        const std::size_t quartile = std::min<std::size_t>(3, (index * 4) / totalBins);
+        if (!std::isfinite(value)) {
+            ++distribution.quartileNonFiniteBins[quartile];
+            if (std::isnan(value)) {
+                ++distribution.nanBins;
+            }
+            else if (value > 0.0f) {
+                ++distribution.positiveInfBins;
+            }
+            else {
+                ++distribution.negativeInfBins;
+            }
+        }
+        else {
+            ++distribution.finiteBins;
+            includeInRange(value, distribution.finiteMin, distribution.finiteMax);
+            if (std::fpclassify(value) == FP_SUBNORMAL) {
+                ++distribution.subnormalBins;
+            }
+
+            if (value == 0.0f) {
+                ++distribution.exactZeroBins;
+                ++distribution.quartileZeroBins[quartile];
+                if (std::signbit(value)) {
+                    ++distribution.negativeZeroBins;
+                }
+            }
+            else if (value < MIN_VALID_FFT_DB) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.belowMinus200Bins;
+                ++distribution.quartileOutOfRangeBins[quartile];
+            }
+            else if (value < -160.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus200ToMinus160Bins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else if (value < -120.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus160ToMinus120Bins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else if (value < -100.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus120ToMinus100Bins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else if (value < -80.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus100ToMinus80Bins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else if (value < -60.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus80ToMinus60Bins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else if (value < -40.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus60ToMinus40Bins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else if (value < -20.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus40ToMinus20Bins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else if (value < 0.0f) {
+                ++distribution.negativeFiniteBins;
+                ++distribution.minus20ToZeroBins;
+                ++distribution.quartileValidBins[quartile];
+            }
+            else {
+                ++distribution.positiveFiniteBins;
+                ++distribution.quartileOutOfRangeBins[quartile];
+                if (value <= 1.0f) {
+                    ++distribution.zeroToOneBins;
+                }
+                else if (value <= 100.0f) {
+                    ++distribution.oneTo100Bins;
+                }
+                else {
+                    ++distribution.above100Bins;
+                }
+            }
+        }
+
+        if (value == 0.0f) {
+            ++distribution.currentZeroRun;
+            distribution.longestZeroRun = std::max(distribution.longestZeroRun,
+                                                   distribution.currentZeroRun);
+        }
+        else {
+            distribution.currentZeroRun = 0;
+            if (distribution.firstNonZeroBin == std::numeric_limits<std::size_t>::max()) {
+                distribution.firstNonZeroBin = index;
+            }
+            distribution.lastNonZeroBin = index;
+        }
     }
 }
 
@@ -626,8 +773,12 @@ private:
                 continue;
             }
 
+            RawFFTDistribution frameDistribution;
+            frameDistribution.totalBins = static_cast<std::size_t>(fftSize);
             for (int i = 0; i < fftSize; ++i) {
                 const float value = fftData[i];
+                recordRawFFTValue(value, static_cast<std::size_t>(i),
+                                  static_cast<std::size_t>(fftSize), frameDistribution);
                 if (!std::isfinite(value)) {
                     sawNonFinite[i] = 1;
                 }
@@ -643,6 +794,22 @@ private:
                 sums[i] += value;
                 ++validCounts[i];
             }
+            const std::size_t sampleIndices[RawFFTDistribution::SAMPLE_COUNT] = {
+                0,
+                1,
+                static_cast<std::size_t>(fftSize) / 8,
+                static_cast<std::size_t>(fftSize) / 4,
+                static_cast<std::size_t>(fftSize) / 2,
+                (static_cast<std::size_t>(fftSize) * 3) / 4,
+                (static_cast<std::size_t>(fftSize) * 7) / 8,
+                static_cast<std::size_t>(fftSize) - 2,
+                static_cast<std::size_t>(fftSize) - 1
+            };
+            for (std::size_t sample = 0; sample < RawFFTDistribution::SAMPLE_COUNT; ++sample) {
+                frameDistribution.sampleIndices[sample] = sampleIndices[sample];
+                frameDistribution.sampleValues[sample] = fftData[sampleIndices[sample]];
+            }
+            segmentDebugStats.rawDistribution = frameDistribution;
             ++capturedFrames;
         }
 
@@ -1089,6 +1256,7 @@ private:
                     segmentDebugStats.rawStartHz / 1e6, segmentDebugStats.rawStopHz / 1e6);
         ImGui::Text("Effective usable start/end: %.6f / %.6f MHz",
                     segmentDebugStats.usableStartHz / 1e6, segmentDebugStats.usableStopHz / 1e6);
+        drawRawFFTDistribution(segmentDebugStats.rawDistribution);
         ImGui::Separator();
         ImGui::Text("FFT values: already dBFS (no additional conversion)");
         drawDebugRange("FFT raw min/max", debugStats.rawMin, debugStats.rawMax);
@@ -1115,6 +1283,80 @@ private:
         }
         else {
             ImGui::Text("%s: no valid data", label);
+        }
+    }
+
+    static void drawRawCount(const char* label, std::size_t count, std::size_t total) {
+        const double percent = total > 0
+                                   ? (100.0 * static_cast<double>(count) / static_cast<double>(total))
+                                   : 0.0;
+        ImGui::Text("%s: %zu (%.3f%%)", label, count, percent);
+    }
+
+    static void drawRawFFTDistribution(const RawFFTDistribution& distribution) {
+        if (!ImGui::CollapsingHeader("Raw FFT distribution before validation",
+                                     ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+
+        ImGui::Text("Expected format: logarithmic power (dBFS-like), not linear magnitude");
+        ImGui::Text("Distribution frame bins: %zu", distribution.totalBins);
+        if (std::isfinite(distribution.finiteMin) && std::isfinite(distribution.finiteMax)) {
+            ImGui::Text("Raw finite min/max: %.9g / %.9g", distribution.finiteMin,
+                        distribution.finiteMax);
+        }
+        else {
+            ImGui::TextUnformatted("Raw finite min/max: no finite data");
+        }
+
+        drawRawCount("Finite", distribution.finiteBins, distribution.totalBins);
+        drawRawCount("Finite negative", distribution.negativeFiniteBins, distribution.totalBins);
+        drawRawCount("Finite positive", distribution.positiveFiniteBins, distribution.totalBins);
+        drawRawCount("Exact +0/-0", distribution.exactZeroBins, distribution.totalBins);
+        drawRawCount("Negative zero", distribution.negativeZeroBins, distribution.totalBins);
+        drawRawCount("Subnormal", distribution.subnormalBins, distribution.totalBins);
+        drawRawCount("NaN", distribution.nanBins, distribution.totalBins);
+        drawRawCount("+Inf", distribution.positiveInfBins, distribution.totalBins);
+        drawRawCount("-Inf", distribution.negativeInfBins, distribution.totalBins);
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Value histogram (one raw frame)");
+        drawRawCount("< -200", distribution.belowMinus200Bins, distribution.totalBins);
+        drawRawCount("[-200, -160)", distribution.minus200ToMinus160Bins, distribution.totalBins);
+        drawRawCount("[-160, -120)", distribution.minus160ToMinus120Bins, distribution.totalBins);
+        drawRawCount("[-120, -100)", distribution.minus120ToMinus100Bins, distribution.totalBins);
+        drawRawCount("[-100, -80)", distribution.minus100ToMinus80Bins, distribution.totalBins);
+        drawRawCount("[-80, -60)", distribution.minus80ToMinus60Bins, distribution.totalBins);
+        drawRawCount("[-60, -40)", distribution.minus60ToMinus40Bins, distribution.totalBins);
+        drawRawCount("[-40, -20)", distribution.minus40ToMinus20Bins, distribution.totalBins);
+        drawRawCount("[-20, 0)", distribution.minus20ToZeroBins, distribution.totalBins);
+        drawRawCount("= 0", distribution.exactZeroBins, distribution.totalBins);
+        drawRawCount("(0, 1]", distribution.zeroToOneBins, distribution.totalBins);
+        drawRawCount("(1, 100]", distribution.oneTo100Bins, distribution.totalBins);
+        drawRawCount("> 100", distribution.above100Bins, distribution.totalBins);
+
+        ImGui::Separator();
+        if (distribution.firstNonZeroBin != std::numeric_limits<std::size_t>::max()) {
+            ImGui::Text("First/last non-zero index: %zu / %zu", distribution.firstNonZeroBin,
+                        distribution.lastNonZeroBin);
+        }
+        else {
+            ImGui::TextUnformatted("First/last non-zero index: none");
+        }
+        ImGui::Text("Longest consecutive zero run: %zu", distribution.longestZeroRun);
+        for (std::size_t quartile = 0; quartile < 4; ++quartile) {
+            ImGui::Text("Q%zu valid/zero/nonfinite/out: %zu / %zu / %zu / %zu", quartile + 1,
+                        distribution.quartileValidBins[quartile],
+                        distribution.quartileZeroBins[quartile],
+                        distribution.quartileNonFiniteBins[quartile],
+                        distribution.quartileOutOfRangeBins[quartile]);
+        }
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Fixed-index raw samples");
+        for (std::size_t sample = 0; sample < RawFFTDistribution::SAMPLE_COUNT; ++sample) {
+            ImGui::Text("[%zu] = %.9g", distribution.sampleIndices[sample],
+                        distribution.sampleValues[sample]);
         }
     }
 
