@@ -164,6 +164,9 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["menuElements"][7]["name"] = "Display";
     defConfig["menuElements"][7]["open"] = true;
 
+    defConfig["menuElements"][8]["name"] = "Wide Spectrum Monitor";
+    defConfig["menuElements"][8]["open"] = true;
+
     defConfig["menuWidth"] = 300;
     defConfig["min"] = -120.0;
     // Scanner logging configuration
@@ -227,6 +230,7 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["Frequency Manager"] = "frequency_manager";
     defConfig["moduleInstances"]["Recorder"] = "recorder";
     defConfig["moduleInstances"]["Rigctl Server"] = "rigctl_server";
+    defConfig["moduleInstances"]["Wide Spectrum Monitor"] = "wide_spectrum_monitor";
     // defConfig["moduleInstances"]["Rigctl Client"] = "rigctl_client";
     // TODO: Enable rigctl_client when ready
     // defConfig["moduleInstances"]["Scanner"] = "scanner";
@@ -325,6 +329,14 @@ int sdrpp_main(int argc, char* argv[]) {
     core::configManager.conf["modules"][modCount++] = "recorder.so";
     core::configManager.conf["modules"][modCount++] = "rigctl_server.so";
     core::configManager.conf["modules"][modCount++] = "scanner.so";
+    core::configManager.conf["modules"][modCount++] = "wide_spectrum_monitor.so";
+
+    // Existing Android installs keep their moduleInstances object. Add this new
+    // built-in module explicitly so upgrading the APK exposes its menu entry.
+    if (!core::configManager.conf["moduleInstances"].contains("Wide Spectrum Monitor")) {
+        core::configManager.conf["moduleInstances"]["Wide Spectrum Monitor"]["module"] = "wide_spectrum_monitor";
+        core::configManager.conf["moduleInstances"]["Wide Spectrum Monitor"]["enabled"] = true;
+    }
 #endif
 
     // Fix missing elements in config
