@@ -56,6 +56,12 @@ task deleteTempAssets (type: Delete) {
     delete 'assets'
 }
 
+task applyV6WaterfallFix(type: Exec) {
+    description = 'Apply V6 raw FFT synchronization fix before native compilation'
+    workingDir '..'
+    commandLine 'python3', 'apply_v6_waterfall_fix.py'
+}
+
 task copyResources(type: Copy) {
     description = 'Copy resources...'
     from '../../root/'
@@ -73,4 +79,5 @@ dependencies {
 }
 
 copyResources.dependsOn deleteTempAssets
+preBuild.dependsOn applyV6WaterfallFix
 preBuild.dependsOn copyResources
