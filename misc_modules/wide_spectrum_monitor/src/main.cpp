@@ -4,8 +4,10 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -39,7 +41,9 @@ namespace {
     constexpr int FFT_FRAME_WAIT_MS = 55;
     constexpr float GRAPH_MIN_DB = -120.0f;
     constexpr float GRAPH_MAX_DB = 0.0f;
-    constexpr float EMPTY_BIN_DB = -160.0f;
+    constexpr float MIN_VALID_FFT_DB = -200.0f;
+    constexpr float MIN_VALID_SWEEP_PERCENT = 95.0f;
+    const float NO_DATA_DBFS = std::numeric_limits<float>::quiet_NaN();
 
     struct SweepSettings {
         double startHz = 225000000.0;
@@ -54,7 +58,28 @@ namespace {
 
     struct DetectedPeak {
         double frequencyHz = 0.0;
-        float levelDbfs = EMPTY_BIN_DB;
+        float levelDbfs = GRAPH_MIN_DB;
+    };
+
+    struct SpectrumDebugStats {
+        std::uint64_t validSamples = 0;
+        std::uint64_t invalidSamples = 0;
+        std::uint64_t nanSamples = 0;
+        std::uint64_t infSamples = 0;
+        std::uint64_t aboveZeroSamples = 0;
+        std::uint64_t belowMinus200Samples = 0;
+        std::uint64_t zeroDefaultSamples = 0;
+        float rawMin = NO_DATA_DBFS;
+        float rawMax = NO_DATA_DBFS;
+        float convertedMin = NO_DATA_DBFS;
+        float convertedMax = NO_DATA_DBFS;
+        std::size_t validWideBins = 0;
+        std::size_t totalWideBins = 0;
+        float validWidePercent = 0.0f;
+        float wideMin = NO_DATA_DBFS;
+        float wideMax = NO_DATA_DBFS;
+        float peakMin = NO_DATA_DBFS;
+        float peakMax = NO_DATA_DBFS;
     };
 
     enum class PendingTuneReason {
@@ -62,6 +87,58 @@ namespace {
         RESTORE_AFTER_STOP,
         SELECTED_PEAK
     };
+
+    void includeInRange(float value, float& minimum, float& maximum) {
+        if (!std::isfinite(minimum) || value < minimum) {
+            minimum = value;
+        }
+        if (!std::isfinite(maximum) || value > maximum) {
+            maximum = value;
+        }
+    }
+
+    bool validateFFTDbfs(float value, SpectrumDebugStats& stats) {
+        if (std::isnan(value)) {
+            ++stats.nanSamples;
+            ++stats.invalidSamples;
+            return false;
+        }
+        if (std::isinf(value)) {
+            ++stats.infSamples;
+            ++stats.invalidSamples;
+            return false;
+        }
+
+        includeInRange(value, stats.rawMin, stats.rawMax);
+        if (value > GRAPH_MAX_DB) {
+            ++stats.aboveZeroSamples;
+            ++stats.invalidSamples;
+            return false;
+        }
+        if (value < MIN_VALID_FFT_DB) {
+            ++stats.belowMinus200Samples;
+            ++stats.invalidSamples;
+            return false;
+        }
+        // WaterFall::setRawFFTSize clears its raw storage to exactly zero. A real
+        // FFT bin may approach full scale, but an exact 0.0 dBFS value is also the
+        // reset/default sentinel and must not become a persistent wide-band spike.
+        if (value == 0.0f) {
+            ++stats.zeroDefaultSamples;
+            ++stats.invalidSamples;
+            return false;
+        }
+
+        ++stats.validSamples;
+        // acquireRawFFT already contains dBFS from IQFrontEnd's VOLK power-spectrum
+        // conversion. "After conversion" is therefore intentionally the same value.
+        includeInRange(value, stats.convertedMin, stats.convertedMax);
+        return true;
+    }
+
+    bool isValidDbfs(float value) {
+        return std::isfinite(value) && value >= MIN_VALID_FFT_DB && value < GRAPH_MAX_DB;
+    }
 }
 
 class WideSpectrumMonitorModule : public ModuleManager::Instance {
@@ -321,6 +398,8 @@ private:
     void clearPeaks() {
         std::lock_guard<std::mutex> lock(displayMutex);
         peakSpectrum.clear();
+        lastDebugStats.peakMin = NO_DATA_DBFS;
+        lastDebugStats.peakMax = NO_DATA_DBFS;
     }
 
     void setError(const std::string& error) {
@@ -376,8 +455,9 @@ private:
         }
 
         while (sweepRequested.load() && !shuttingDown.load()) {
-            std::vector<float> cycleSpectrum(WIDE_BIN_COUNT, EMPTY_BIN_DB);
+            std::vector<float> cycleSpectrum(WIDE_BIN_COUNT, NO_DATA_DBFS);
             std::vector<float> cycleQuality(WIDE_BIN_COUNT, -1.0f);
+            SpectrumDebugStats cycleDebugStats;
             bool capturedAnySegment = false;
             const auto sweepStartedAt = std::chrono::steady_clock::now();
 
@@ -400,7 +480,7 @@ private:
                 }
 
                 std::vector<float> averagedFFT;
-                if (!captureAveragedFFT(settings.fftAveraging, averagedFFT)) {
+                if (!captureAveragedFFT(settings.fftAveraging, averagedFFT, cycleDebugStats)) {
                     if (!sweepRequested.load() || shuttingDown.load()) {
                         break;
                     }
@@ -426,7 +506,7 @@ private:
 
             const double sweepSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - sweepStartedAt).count();
-            publishSweep(settings, std::move(cycleSpectrum), sweepSeconds);
+            publishSweep(settings, std::move(cycleSpectrum), sweepSeconds, cycleDebugStats);
         }
     }
 
@@ -468,8 +548,10 @@ private:
         return centers;
     }
 
-    bool captureAveragedFFT(int requestedFrames, std::vector<float>& averagedFFT) {
+    bool captureAveragedFFT(int requestedFrames, std::vector<float>& averagedFFT,
+                            SpectrumDebugStats& debugStats) {
         std::vector<double> sums;
+        std::vector<unsigned int> validCounts;
         int capturedFrames = 0;
         int attempts = 0;
         const int maxAttempts = requestedFrames + 5;
@@ -493,15 +575,22 @@ private:
 
             if (sums.empty()) {
                 sums.assign(fftSize, 0.0);
+                validCounts.assign(fftSize, 0);
             }
             if (static_cast<int>(sums.size()) != fftSize) {
                 sums.clear();
+                validCounts.clear();
                 capturedFrames = 0;
                 continue;
             }
 
             for (int i = 0; i < fftSize; ++i) {
-                sums[i] += fftData[i];
+                const float value = fftData[i];
+                if (!validateFFTDbfs(value, debugStats)) {
+                    continue;
+                }
+                sums[i] += value;
+                ++validCounts[i];
             }
             ++capturedFrames;
         }
@@ -512,7 +601,9 @@ private:
 
         averagedFFT.resize(sums.size());
         for (std::size_t i = 0; i < sums.size(); ++i) {
-            averagedFFT[i] = static_cast<float>(sums[i] / static_cast<double>(capturedFrames));
+            averagedFFT[i] = validCounts[i] > 0
+                                 ? static_cast<float>(sums[i] / static_cast<double>(validCounts[i]))
+                                 : NO_DATA_DBFS;
         }
         return true;
     }
@@ -529,6 +620,8 @@ private:
         const double rawStartHz = centerHz - (settings.sampleRateHz * 0.5);
         const double usableStartHz = centerHz - usableHalf;
         const double usableStopHz = centerHz + usableHalf;
+        const double wideBinWidthHz = range / static_cast<double>(output.size());
+        const double fftSize = static_cast<double>(fft.size());
 
         for (std::size_t i = 0; i < output.size(); ++i) {
             const double frequencyHz = settings.startHz + ((static_cast<double>(i) + 0.5) * range / output.size());
@@ -541,11 +634,28 @@ private:
                 continue;
             }
 
-            const double rawPosition = ((frequencyHz - rawStartHz) / settings.sampleRateHz) * static_cast<double>(fft.size());
-            const int lower = std::clamp(static_cast<int>(std::floor(rawPosition)), 0, static_cast<int>(fft.size()) - 1);
-            const int upper = std::min(lower + 1, static_cast<int>(fft.size()) - 1);
-            const float fraction = static_cast<float>(rawPosition - std::floor(rawPosition));
-            const float level = fft[lower] + ((fft[upper] - fft[lower]) * fraction);
+            const double binStartHz = settings.startHz + (static_cast<double>(i) * wideBinWidthHz);
+            const double binStopHz = binStartHz + wideBinWidthHz;
+            const double wideStartHz = std::max(binStartHz, usableStartHz);
+            const double wideStopHz = std::min(binStopHz, usableStopHz);
+            if (wideStopHz <= wideStartHz) {
+                continue;
+            }
+
+            const double rawBegin = ((wideStartHz - rawStartHz) / settings.sampleRateHz) * fftSize;
+            const double rawEnd = ((wideStopHz - rawStartHz) / settings.sampleRateHz) * fftSize;
+            const std::size_t first = static_cast<std::size_t>(
+                std::clamp(std::floor(rawBegin), 0.0, fftSize - 1.0));
+            const std::size_t lastExclusive = static_cast<std::size_t>(
+                std::clamp(std::ceil(rawEnd), static_cast<double>(first + 1), fftSize));
+
+            float level = NO_DATA_DBFS;
+            for (std::size_t rawIndex = first; rawIndex < lastExclusive; ++rawIndex) {
+                const float candidate = fft[rawIndex];
+                if (isValidDbfs(candidate) && (!std::isfinite(level) || candidate > level)) {
+                    level = candidate;
+                }
+            }
             if (!std::isfinite(level)) {
                 continue;
             }
@@ -555,7 +665,33 @@ private:
         }
     }
 
-    void publishSweep(const SweepSettings& settings, std::vector<float> spectrum, double sweepSeconds) {
+    void publishSweep(const SweepSettings& settings, std::vector<float> spectrum, double sweepSeconds,
+                      SpectrumDebugStats debugStats) {
+        debugStats.totalWideBins = spectrum.size();
+        for (float level : spectrum) {
+            if (!isValidDbfs(level)) {
+                continue;
+            }
+            ++debugStats.validWideBins;
+            includeInRange(level, debugStats.wideMin, debugStats.wideMax);
+        }
+        if (debugStats.totalWideBins > 0) {
+            debugStats.validWidePercent = 100.0f * static_cast<float>(debugStats.validWideBins) /
+                                          static_cast<float>(debugStats.totalWideBins);
+        }
+
+        if (debugStats.validWidePercent < MIN_VALID_SWEEP_PERCENT) {
+            char warning[160];
+            std::snprintf(warning, sizeof(warning),
+                          "Sweep not published: only %.1f%% of wide-spectrum bins contain valid FFT data",
+                          debugStats.validWidePercent);
+            std::lock_guard<std::mutex> lock(displayMutex);
+            lastDebugStats = debugStats;
+            lastError = warning;
+            statusText = completedSweepValid ? "Sweeping (invalid sweep discarded)" : "Waiting for valid complete sweep";
+            return;
+        }
+
         std::vector<DetectedPeak> peaks = detectPeaks(settings, spectrum);
         std::lock_guard<std::mutex> lock(displayMutex);
         const bool rangeChanged = !completedSweepValid ||
@@ -563,6 +699,7 @@ private:
                                   std::abs(displayedStopHz - settings.stopHz) > 1.0;
         completedSweep = std::move(spectrum);
         detectedPeaks = std::move(peaks);
+        lastError.clear();
         displayedStartHz = settings.startHz;
         displayedStopHz = settings.stopHz;
         activeSampleRateHz = settings.sampleRateHz;
@@ -577,15 +714,26 @@ private:
 
         if (settings.peakHold) {
             if (rangeChanged || peakSpectrum.size() != completedSweep.size()) {
-                peakSpectrum.assign(completedSweep.size(), EMPTY_BIN_DB);
+                peakSpectrum.assign(completedSweep.size(), NO_DATA_DBFS);
             }
             for (std::size_t i = 0; i < completedSweep.size(); ++i) {
-                peakSpectrum[i] = std::max(peakSpectrum[i], completedSweep[i]);
+                if (!isValidDbfs(completedSweep[i])) {
+                    continue;
+                }
+                if (!isValidDbfs(peakSpectrum[i]) || completedSweep[i] > peakSpectrum[i]) {
+                    peakSpectrum[i] = completedSweep[i];
+                }
+            }
+            for (float level : peakSpectrum) {
+                if (isValidDbfs(level)) {
+                    includeInRange(level, debugStats.peakMin, debugStats.peakMax);
+                }
             }
         }
         else if (rangeChanged) {
             peakSpectrum.clear();
         }
+        lastDebugStats = debugStats;
     }
 
     std::vector<DetectedPeak> detectPeaks(const SweepSettings& settings, const std::vector<float>& spectrum) const {
@@ -597,6 +745,9 @@ private:
         const double binWidthHz = (settings.stopHz - settings.startHz) / spectrum.size();
         for (std::size_t i = 1; i + 1 < spectrum.size(); ++i) {
             const float level = spectrum[i];
+            if (!isValidDbfs(spectrum[i - 1]) || !isValidDbfs(level) || !isValidDbfs(spectrum[i + 1])) {
+                continue;
+            }
             if (level < settings.thresholdDbfs || level < spectrum[i - 1] || level <= spectrum[i + 1]) {
                 continue;
             }
@@ -739,13 +890,21 @@ private:
             if (data.size() < 2) {
                 return;
             }
-            std::vector<ImVec2> points;
-            points.reserve(data.size());
+            bool havePrevious = false;
+            ImVec2 previous;
             for (std::size_t i = 0; i < data.size(); ++i) {
+                if (!isValidDbfs(data[i])) {
+                    havePrevious = false;
+                    continue;
+                }
                 const float xRatio = static_cast<float>(i) / static_cast<float>(data.size() - 1);
-                points.emplace_back(plotMin.x + (xRatio * (plotMax.x - plotMin.x)), levelToY(data[i]));
+                const ImVec2 point(plotMin.x + (xRatio * (plotMax.x - plotMin.x)), levelToY(data[i]));
+                if (havePrevious) {
+                    drawList->AddLine(previous, point, color, thickness * scale);
+                }
+                previous = point;
+                havePrevious = true;
             }
-            drawList->AddPolyline(points.data(), static_cast<int>(points.size()), color, ImDrawFlags_None, thickness * scale);
         };
 
         drawTrace(spectrum, IM_COL32(40, 220, 150, 255), 1.5f);
@@ -813,6 +972,7 @@ private:
         double sampleRateHz = 0.0;
         double usableBandwidthHz = 0.0;
         double segmentStepHz = 0.0;
+        SpectrumDebugStats debugStats;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             segment = currentSegment;
@@ -824,6 +984,7 @@ private:
             sampleRateHz = activeSampleRateHz;
             usableBandwidthHz = activeUsableBandwidthHz;
             segmentStepHz = activeSegmentStepHz;
+            debugStats = lastDebugStats;
         }
 
         ImGui::Text("Worker active: %s", workerActive.load() ? "yes" : "no");
@@ -835,6 +996,33 @@ private:
         ImGui::Text("Sample rate: %.3f MS/s", sampleRateHz / 1e6);
         ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
         ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
+        ImGui::Separator();
+        ImGui::Text("FFT values: already dBFS (no additional conversion)");
+        drawDebugRange("FFT raw min/max", debugStats.rawMin, debugStats.rawMax);
+        drawDebugRange("FFT dBFS min/max", debugStats.convertedMin, debugStats.convertedMax);
+        ImGui::Text("Valid FFT samples: %llu", static_cast<unsigned long long>(debugStats.validSamples));
+        ImGui::Text("Invalid FFT samples: %llu", static_cast<unsigned long long>(debugStats.invalidSamples));
+        ImGui::Text("NaN / Inf: %llu / %llu",
+                    static_cast<unsigned long long>(debugStats.nanSamples),
+                    static_cast<unsigned long long>(debugStats.infSamples));
+        ImGui::Text("Above 0 / below -200 dBFS: %llu / %llu",
+                    static_cast<unsigned long long>(debugStats.aboveZeroSamples),
+                    static_cast<unsigned long long>(debugStats.belowMinus200Samples));
+        ImGui::Text("Zero/default samples: %llu",
+                    static_cast<unsigned long long>(debugStats.zeroDefaultSamples));
+        ImGui::Text("Completed valid bins: %.1f%% (%zu / %zu)",
+                    debugStats.validWidePercent, debugStats.validWideBins, debugStats.totalWideBins);
+        drawDebugRange("Wide spectrum min/max", debugStats.wideMin, debugStats.wideMax);
+        drawDebugRange("Peak Hold min/max", debugStats.peakMin, debugStats.peakMax);
+    }
+
+    static void drawDebugRange(const char* label, float minimum, float maximum) {
+        if (std::isfinite(minimum) && std::isfinite(maximum)) {
+            ImGui::Text("%s: %.1f / %.1f dBFS", label, minimum, maximum);
+        }
+        else {
+            ImGui::Text("%s: no valid data", label);
+        }
     }
 
     std::string name;
@@ -874,6 +1062,7 @@ private:
     bool completedSweepValid = false;
     double lastSweepSeconds = 0.0;
     double sweepsPerMinute = 0.0;
+    SpectrumDebugStats lastDebugStats;
 
     double returnFrequencyHz = 0.0;
     double pendingTuneHz = 0.0;
