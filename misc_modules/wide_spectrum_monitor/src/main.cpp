@@ -56,6 +56,12 @@ namespace {
         double frequencyHz = 0.0;
         float levelDbfs = EMPTY_BIN_DB;
     };
+
+    enum class PendingTuneReason {
+        NONE,
+        RESTORE_AFTER_STOP,
+        SELECTED_PEAK
+    };
 }
 
 class WideSpectrumMonitorModule : public ModuleManager::Instance {
@@ -203,8 +209,9 @@ private:
             }
         }
         else if (ImGui::Button(("Stop Sweep##wsm_stop_button_" + name).c_str(), ImVec2(width, 0.0f))) {
-            requestStop("Stopping sweep...");
+            requestStop("Stopped");
             pendingTuneHz = returnFrequencyHz;
+            pendingTuneReason = PendingTuneReason::RESTORE_AFTER_STOP;
         }
 
         if (ImGui::Button(("Clear Peaks##wsm_clear_" + name).c_str(), ImVec2(width, 0.0f))) {
@@ -214,6 +221,7 @@ private:
         drawStatus();
         drawSpectrumGraph();
         drawPeakTable();
+        drawDebugInfo();
 
         ImGui::Spacing();
         ImGui::TextWrapped("Uses the active source sample rate and the central 85%% of every FFT segment. RTL AGC and Tuner AGC are never changed.");
@@ -265,8 +273,10 @@ private:
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             lastError.clear();
-            statusText = "Starting sweep...";
+            statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
             activeSampleRateHz = sampleRateHz;
+            activeUsableBandwidthHz = sampleRateHz * USABLE_BANDWIDTH_RATIO;
+            activeSegmentStepHz = activeUsableBandwidthHz * (1.0 - (overlapPercent / 100.0));
             currentSegment = 0;
             segmentCount = 0;
         }
@@ -291,19 +301,26 @@ private:
         }
 
         const double targetHz = pendingTuneHz;
+        const PendingTuneReason reason = pendingTuneReason;
         pendingTuneHz = 0.0;
+        pendingTuneReason = PendingTuneReason::NONE;
         tuner::centerTuning(gui::waterfall.selectedVFO, targetHz);
         {
             std::lock_guard<std::mutex> lock(displayMutex);
-            statusText = "Tuned to selected frequency";
+            statusText = (reason == PendingTuneReason::SELECTED_PEAK) ? "Tuned to selected frequency" : "Stopped";
             currentCenterHz = targetHz;
         }
-        flog::info("Wide Spectrum Monitor: Tuned to selected peak {:.6f} MHz", targetHz / 1e6);
+        if (reason == PendingTuneReason::SELECTED_PEAK) {
+            flog::info("Wide Spectrum Monitor: Tuned to selected peak {:.6f} MHz", targetHz / 1e6);
+        }
+        else {
+            flog::info("Wide Spectrum Monitor: Restored pre-sweep frequency {:.6f} MHz", targetHz / 1e6);
+        }
     }
 
     void clearPeaks() {
         std::lock_guard<std::mutex> lock(displayMutex);
-        peakSpectrum.assign(currentSpectrum.size(), EMPTY_BIN_DB);
+        peakSpectrum.clear();
     }
 
     void setError(const std::string& error) {
@@ -341,12 +358,6 @@ private:
             }
             workerActive.store(false);
 
-            if (!shuttingDown.load() && !sweepRequested.load()) {
-                std::lock_guard<std::mutex> lock(displayMutex);
-                if (lastError.empty() && statusText == "Stopping sweep...") {
-                    statusText = "Stopped";
-                }
-            }
         }
         workerActive.store(false);
     }
@@ -361,13 +372,14 @@ private:
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             segmentCount = static_cast<int>(centers.size());
-            statusText = "Sweeping";
+            statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
         }
 
         while (sweepRequested.load() && !shuttingDown.load()) {
             std::vector<float> cycleSpectrum(WIDE_BIN_COUNT, EMPTY_BIN_DB);
             std::vector<float> cycleQuality(WIDE_BIN_COUNT, -1.0f);
             bool capturedAnySegment = false;
+            const auto sweepStartedAt = std::chrono::steady_clock::now();
 
             for (std::size_t segmentIndex = 0; segmentIndex < centers.size(); ++segmentIndex) {
                 if (!sweepRequested.load() || shuttingDown.load()) {
@@ -400,10 +412,7 @@ private:
                 capturedAnySegment = true;
                 {
                     std::lock_guard<std::mutex> lock(displayMutex);
-                    currentSpectrum = cycleSpectrum;
-                    displayedStartHz = settings.startHz;
-                    displayedStopHz = settings.stopHz;
-                    statusText = "Sweeping";
+                    statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
                 }
             }
 
@@ -415,7 +424,9 @@ private:
                 return;
             }
 
-            publishSweep(settings, std::move(cycleSpectrum));
+            const double sweepSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - sweepStartedAt).count();
+            publishSweep(settings, std::move(cycleSpectrum), sweepSeconds);
         }
     }
 
@@ -544,27 +555,36 @@ private:
         }
     }
 
-    void publishSweep(const SweepSettings& settings, std::vector<float> spectrum) {
+    void publishSweep(const SweepSettings& settings, std::vector<float> spectrum, double sweepSeconds) {
         std::vector<DetectedPeak> peaks = detectPeaks(settings, spectrum);
         std::lock_guard<std::mutex> lock(displayMutex);
-        currentSpectrum = std::move(spectrum);
+        const bool rangeChanged = !completedSweepValid ||
+                                  std::abs(displayedStartHz - settings.startHz) > 1.0 ||
+                                  std::abs(displayedStopHz - settings.stopHz) > 1.0;
+        completedSweep = std::move(spectrum);
         detectedPeaks = std::move(peaks);
         displayedStartHz = settings.startHz;
         displayedStopHz = settings.stopHz;
         activeSampleRateHz = settings.sampleRateHz;
+        activeUsableBandwidthHz = settings.sampleRateHz * USABLE_BANDWIDTH_RATIO;
+        activeSegmentStepHz = activeUsableBandwidthHz * (1.0 - (settings.overlapPercent / 100.0));
+        completedSweepValid = true;
+        currentSegment = segmentCount;
+        lastSweepSeconds = sweepSeconds;
+        sweepsPerMinute = (sweepSeconds > 0.0) ? (60.0 / sweepSeconds) : 0.0;
         ++completedSweeps;
         statusText = "Sweeping";
 
-        if (peakSpectrum.size() != currentSpectrum.size()) {
-            peakSpectrum.assign(currentSpectrum.size(), EMPTY_BIN_DB);
-        }
         if (settings.peakHold) {
-            for (std::size_t i = 0; i < currentSpectrum.size(); ++i) {
-                peakSpectrum[i] = std::max(peakSpectrum[i], currentSpectrum[i]);
+            if (rangeChanged || peakSpectrum.size() != completedSweep.size()) {
+                peakSpectrum.assign(completedSweep.size(), EMPTY_BIN_DB);
+            }
+            for (std::size_t i = 0; i < completedSweep.size(); ++i) {
+                peakSpectrum[i] = std::max(peakSpectrum[i], completedSweep[i]);
             }
         }
-        else {
-            peakSpectrum = currentSpectrum;
+        else if (rangeChanged) {
+            peakSpectrum.clear();
         }
     }
 
@@ -612,6 +632,8 @@ private:
         int sweeps = 0;
         double centerHz = 0.0;
         double sampleRateHz = 0.0;
+        double sweepSeconds = 0.0;
+        double sweepsPerMinuteValue = 0.0;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             status = statusText;
@@ -621,6 +643,8 @@ private:
             sweeps = completedSweeps;
             centerHz = currentCenterHz;
             sampleRateHz = activeSampleRateHz;
+            sweepSeconds = lastSweepSeconds;
+            sweepsPerMinuteValue = sweepsPerMinute;
         }
 
         ImGui::Separator();
@@ -630,6 +654,9 @@ private:
         }
         if (centerHz > 0.0) {
             ImGui::Text("Center: %.3f MHz | Rate: %.3f MS/s", centerHz / 1e6, sampleRateHz / 1e6);
+        }
+        if (sweepSeconds > 0.0) {
+            ImGui::Text("Last Sweep: %.1f s | %.2f sweeps/min", sweepSeconds, sweepsPerMinuteValue);
         }
         if (!error.empty()) {
             ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", error.c_str());
@@ -643,7 +670,7 @@ private:
         double stopHz = stopFrequencyMHz * 1e6;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
-            spectrum = currentSpectrum;
+            spectrum = completedSweep;
             heldPeaks = peakSpectrum;
             if (displayedStopHz > displayedStartHz) {
                 startHz = displayedStartHz;
@@ -696,6 +723,17 @@ private:
 
         const float thresholdY = levelToY(thresholdDbfs);
         drawList->AddLine(ImVec2(plotMin.x, thresholdY), ImVec2(plotMax.x, thresholdY), IM_COL32(255, 165, 40, 255), 1.5f * scale);
+        std::snprintf(label, sizeof(label), "Threshold %.1f dBFS", thresholdDbfs);
+        drawList->AddText(ImVec2(plotMin.x + (4.0f * scale), std::max(plotMin.y, thresholdY - (17.0f * scale))),
+                          IM_COL32(255, 180, 65, 255), label);
+
+        if (spectrum.empty()) {
+            const char* waitingText = "Waiting for first complete sweep";
+            const ImVec2 textSize = ImGui::CalcTextSize(waitingText);
+            drawList->AddText(ImVec2(plotMin.x + ((plotMax.x - plotMin.x - textSize.x) * 0.5f),
+                                     plotMin.y + ((plotMax.y - plotMin.y - textSize.y) * 0.5f)),
+                              IM_COL32(205, 210, 220, 255), waitingText);
+        }
 
         auto drawTrace = [&](const std::vector<float>& data, ImU32 color, float thickness) {
             if (data.size() < 2) {
@@ -718,12 +756,18 @@ private:
 
     void drawPeakTable() {
         std::vector<DetectedPeak> peaks;
+        bool valid = false;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             peaks = detectedPeaks;
+            valid = completedSweepValid;
         }
 
         ImGui::TextUnformatted("Strongest Detected Peaks");
+        if (!valid) {
+            ImGui::TextDisabled("Waiting for first complete sweep.");
+            return;
+        }
         if (peaks.empty()) {
             ImGui::TextDisabled("No peaks above threshold in the last completed sweep.");
             return;
@@ -744,14 +788,53 @@ private:
             char frequencyLabel[96];
             std::snprintf(frequencyLabel, sizeof(frequencyLabel), "%.6f##wsm_peak_%zu_%s", peaks[i].frequencyHz / 1e6, i, name.c_str());
             if (ImGui::Selectable(frequencyLabel, false, ImGuiSelectableFlags_SpanAllColumns)) {
-                requestStop("Stopping to tune selected peak...");
+                requestStop("Stopped");
                 pendingTuneHz = peaks[i].frequencyHz;
+                pendingTuneReason = PendingTuneReason::SELECTED_PEAK;
             }
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("%.1f", peaks[i].levelDbfs);
         }
         ImGui::EndTable();
         ImGui::TextDisabled("Tap a row to stop the sweep and tune SDR++.");
+    }
+
+    void drawDebugInfo() {
+        if (!ImGui::CollapsingHeader(("Debug##wsm_debug_" + name).c_str())) {
+            return;
+        }
+
+        int segment = 0;
+        int totalSegments = 0;
+        int completedCount = 0;
+        bool completedValid = false;
+        std::size_t completedBins = 0;
+        double sweepSeconds = 0.0;
+        double sampleRateHz = 0.0;
+        double usableBandwidthHz = 0.0;
+        double segmentStepHz = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(displayMutex);
+            segment = currentSegment;
+            totalSegments = segmentCount;
+            completedCount = completedSweeps;
+            completedValid = completedSweepValid;
+            completedBins = completedSweep.size();
+            sweepSeconds = lastSweepSeconds;
+            sampleRateHz = activeSampleRateHz;
+            usableBandwidthHz = activeUsableBandwidthHz;
+            segmentStepHz = activeSegmentStepHz;
+        }
+
+        ImGui::Text("Worker active: %s", workerActive.load() ? "yes" : "no");
+        ImGui::Text("Working segment: %d / %d", segment, totalSegments);
+        ImGui::Text("Completed sweeps: %d", completedCount);
+        ImGui::Text("Completed sweep valid: %s", completedValid ? "yes" : "no");
+        ImGui::Text("Completed bins: %zu", completedBins);
+        ImGui::Text("Last sweep duration: %.3f s", sweepSeconds);
+        ImGui::Text("Sample rate: %.3f MS/s", sampleRateHz / 1e6);
+        ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
+        ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
     }
 
     std::string name;
@@ -774,7 +857,7 @@ private:
     SweepSettings queuedSettings;
 
     std::mutex displayMutex;
-    std::vector<float> currentSpectrum;
+    std::vector<float> completedSweep;
     std::vector<float> peakSpectrum;
     std::vector<DetectedPeak> detectedPeaks;
     std::string statusText = "Ready";
@@ -782,13 +865,19 @@ private:
     double displayedStartHz = 0.0;
     double displayedStopHz = 0.0;
     double activeSampleRateHz = 0.0;
+    double activeUsableBandwidthHz = 0.0;
+    double activeSegmentStepHz = 0.0;
     double currentCenterHz = 0.0;
     int currentSegment = 0;
     int segmentCount = 0;
     int completedSweeps = 0;
+    bool completedSweepValid = false;
+    double lastSweepSeconds = 0.0;
+    double sweepsPerMinute = 0.0;
 
     double returnFrequencyHz = 0.0;
     double pendingTuneHz = 0.0;
+    PendingTuneReason pendingTuneReason = PendingTuneReason::NONE;
     EventHandler<bool> playStateHandler;
 };
 
