@@ -322,13 +322,10 @@ class WideSpectrumMonitorModule : public ModuleManager::Instance {
 public:
     explicit WideSpectrumMonitorModule(std::string instanceName) : name(std::move(instanceName)) {
         loadConfig();
+        iqSink.init(nullptr, iqStreamHandler, this);
 
         if (initializeDirectFFT()) {
             iqCaptureBuffer.reserve(DIRECT_FFT_SIZE);
-            iqSink.init(&iqStream, iqStreamHandler, this);
-            iqSink.start();
-            sigpath::iqFrontEnd.bindIQStream(&iqStream);
-            iqStreamBound = true;
         }
         else {
             statusText = "FFT initialization failed";
@@ -361,11 +358,7 @@ public:
         if (workerThread.joinable()) {
             workerThread.join();
         }
-        if (iqStreamBound) {
-            sigpath::iqFrontEnd.unbindIQStream(&iqStream);
-            iqSink.stop();
-            iqStreamBound = false;
-        }
+        stopIQCapturePath();
         releaseDirectFFT();
         gui::menu.removeEntry(name);
     }
@@ -427,6 +420,43 @@ private:
         ++instance->iqFrameGeneration;
         lock.unlock();
         instance->iqCaptureCv.notify_all();
+    }
+
+    bool startIQCapturePath() {
+        stopIQCapturePath();
+
+        try {
+            iqStream = new dsp::stream<dsp::complex_t>();
+            iqSink.setInput(iqStream);
+            iqSink.start();
+            sigpath::iqFrontEnd.bindIQStream(iqStream);
+            iqStreamBound = true;
+        }
+        catch (const std::exception& e) {
+            iqSink.stop();
+            delete iqStream;
+            iqStream = nullptr;
+            flog::error("Wide Spectrum Monitor: Could not start IQ capture path: {}", e.what());
+            return false;
+        }
+        catch (...) {
+            iqSink.stop();
+            delete iqStream;
+            iqStream = nullptr;
+            flog::error("Wide Spectrum Monitor: Could not start IQ capture path");
+            return false;
+        }
+        return true;
+    }
+
+    void stopIQCapturePath() {
+        if (iqStreamBound) {
+            sigpath::iqFrontEnd.unbindIQStream(iqStream);
+            iqStreamBound = false;
+        }
+        iqSink.stop();
+        delete iqStream;
+        iqStream = nullptr;
     }
 
     bool initializeDirectFFT() {
@@ -572,8 +602,8 @@ private:
         sanitizeControls();
         saveConfig();
 
-        if (!iqStreamBound || !directFFTPlan) {
-            setError("The private IQ/FFT path is unavailable");
+        if (!directFFTPlan) {
+            setError("The private FFT path is unavailable");
             return;
         }
         if (!workerThread.joinable()) {
@@ -607,6 +637,10 @@ private:
 
         if (!std::isfinite(settings.startHz) || !std::isfinite(settings.stopHz) || settings.stopHz <= settings.startHz) {
             setError("Stop frequency must be higher than start frequency");
+            return;
+        }
+        if (!startIQCapturePath()) {
+            setError("The private IQ capture path could not be started");
             return;
         }
 
@@ -706,6 +740,7 @@ private:
             catch (...) {
                 setError("Sweep worker failed with an unknown error");
             }
+            stopIQCapturePath();
             workerActive.store(false);
         }
         workerActive.store(false);
@@ -837,7 +872,7 @@ private:
     bool captureIQFrame(std::size_t sampleCount, double sampleRateHz,
                         std::vector<dsp::complex_t>& samples,
                         std::uint64_t& generation) {
-        if (!iqStreamBound || sampleCount < 2 || sampleCount > DIRECT_FFT_SIZE ||
+        if (!iqStreamBound || !iqStream || sampleCount < 2 || sampleCount > DIRECT_FFT_SIZE ||
             !std::isfinite(sampleRateHz) || sampleRateHz <= 0.0) {
             return false;
         }
@@ -1403,7 +1438,7 @@ private:
         ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
         ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
         ImGui::Separator();
-        ImGui::TextUnformatted("FFT source: private bound IQFrontEnd stream (V9)");
+        ImGui::TextUnformatted("FFT source: private operation-bound IQFrontEnd stream");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
         ImGui::Text("Direct FFT bin count: %zu", segmentDebugStats.rawFftBinCount);
         ImGui::Text("IQ samples per FFT frame: %zu", segmentDebugStats.iqSamplesPerFrame);
@@ -1545,7 +1580,7 @@ private:
     std::condition_variable requestCv;
     SweepSettings queuedSettings;
 
-    dsp::stream<dsp::complex_t> iqStream;
+    dsp::stream<dsp::complex_t>* iqStream = nullptr;
     dsp::sink::Handler<dsp::complex_t> iqSink;
     bool iqStreamBound = false;
     std::mutex iqCaptureMutex;
