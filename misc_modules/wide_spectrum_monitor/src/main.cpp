@@ -153,11 +153,54 @@ namespace {
         RawFFTDistribution rawDistribution;
     };
 
+    enum class IQCaptureEndReason {
+        NONE,
+        IN_PROGRESS,
+        TIMEOUT,
+        CANCELLED,
+        COMPLETED,
+        INVALID_REQUEST,
+        RESULT_MISMATCH
+    };
+
+    struct IQCaptureDiagnostics {
+        std::uint64_t handlerCalls = 0;
+        std::uint64_t handlerSamples = 0;
+        std::uint64_t requestedHandlerCalls = 0;
+        std::uint64_t requestedHandlerSamples = 0;
+        std::uint64_t discardedChunks = 0;
+        std::size_t copiedSamples = 0;
+        std::size_t targetSamples = 0;
+        int lastHandlerChunkSize = 0;
+        IQCaptureEndReason endReason = IQCaptureEndReason::NONE;
+        std::uint64_t generation = 0;
+    };
+
     enum class PendingTuneReason {
         NONE,
         RESTORE_AFTER_STOP,
         SELECTED_PEAK
     };
+
+    const char* iqCaptureEndReasonText(IQCaptureEndReason reason) {
+        switch (reason) {
+        case IQCaptureEndReason::IN_PROGRESS:
+            return "in progress";
+        case IQCaptureEndReason::TIMEOUT:
+            return "timeout";
+        case IQCaptureEndReason::CANCELLED:
+            return "sweep cancellation/shutdown";
+        case IQCaptureEndReason::COMPLETED:
+            return "successful frame completion";
+        case IQCaptureEndReason::INVALID_REQUEST:
+            return "invalid capture request";
+        case IQCaptureEndReason::RESULT_MISMATCH:
+            return "completed generation with sample-count mismatch";
+        case IQCaptureEndReason::NONE:
+        default:
+            return "no capture attempt";
+        }
+    }
 
     void includeInRange(float value, float& minimum, float& maximum) {
         if (!std::isfinite(minimum) || value < minimum) {
@@ -395,8 +438,17 @@ private:
         }
 
         auto* instance = static_cast<WideSpectrumMonitorModule*>(ctx);
+        instance->iqHandlerCalls.fetch_add(1, std::memory_order_relaxed);
+        instance->iqHandlerSamples.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+        instance->iqLastHandlerChunkSize.store(count, std::memory_order_relaxed);
+
         std::unique_lock<std::mutex> lock(instance->iqCaptureMutex);
-        if (!instance->iqCaptureRequested || instance->shuttingDown.load()) {
+        if (!instance->iqCaptureRequested) {
+            return;
+        }
+        instance->iqRequestedHandlerCalls.fetch_add(1, std::memory_order_relaxed);
+        instance->iqRequestedHandlerSamples.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+        if (instance->shuttingDown.load()) {
             return;
         }
 
@@ -405,6 +457,7 @@ private:
         // than the post-tune capture request.
         if (instance->discardNextIQChunk) {
             instance->discardNextIQChunk = false;
+            instance->iqDiscardedChunks.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -412,14 +465,46 @@ private:
         const std::size_t needed = instance->iqCaptureTarget - instance->iqCaptureBuffer.size();
         const std::size_t copyCount = std::min(available, needed);
         instance->iqCaptureBuffer.insert(instance->iqCaptureBuffer.end(), data, data + copyCount);
+        instance->iqLastCaptureCopiedSamples = instance->iqCaptureBuffer.size();
         if (instance->iqCaptureBuffer.size() != instance->iqCaptureTarget) {
             return;
         }
 
         instance->iqCaptureRequested = false;
         ++instance->iqFrameGeneration;
+        instance->iqLastCaptureEndReason = IQCaptureEndReason::COMPLETED;
+        instance->iqLastCaptureGeneration = instance->iqFrameGeneration;
         lock.unlock();
         instance->iqCaptureCv.notify_all();
+    }
+
+    IQCaptureDiagnostics snapshotIQCaptureDiagnostics() {
+        IQCaptureDiagnostics diagnostics;
+        diagnostics.handlerCalls = iqHandlerCalls.load(std::memory_order_relaxed);
+        diagnostics.handlerSamples = iqHandlerSamples.load(std::memory_order_relaxed);
+        diagnostics.requestedHandlerCalls = iqRequestedHandlerCalls.load(std::memory_order_relaxed);
+        diagnostics.requestedHandlerSamples = iqRequestedHandlerSamples.load(std::memory_order_relaxed);
+        diagnostics.discardedChunks = iqDiscardedChunks.load(std::memory_order_relaxed);
+        diagnostics.lastHandlerChunkSize = iqLastHandlerChunkSize.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(iqCaptureMutex);
+            diagnostics.copiedSamples = iqLastCaptureCopiedSamples;
+            diagnostics.targetSamples = iqLastCaptureTargetSamples;
+            diagnostics.endReason = iqLastCaptureEndReason;
+            diagnostics.generation = iqLastCaptureGeneration;
+        }
+        return diagnostics;
+    }
+
+    void logIQCaptureFailure(const IQCaptureDiagnostics& diagnostics) {
+        flog::error(
+            "Wide Spectrum Monitor: IQ capture failed: reason={}, handler_calls={}, handler_samples={}, "
+            "request_calls={}, request_samples={}, discarded_chunks={}, copied={}/{}, last_chunk={}, generation={}",
+            iqCaptureEndReasonText(diagnostics.endReason), diagnostics.handlerCalls,
+            diagnostics.handlerSamples, diagnostics.requestedHandlerCalls,
+            diagnostics.requestedHandlerSamples, diagnostics.discardedChunks,
+            diagnostics.copiedSamples, diagnostics.targetSamples,
+            diagnostics.lastHandlerChunkSize, diagnostics.generation);
     }
 
     bool startIQCapturePath() {
@@ -874,6 +959,14 @@ private:
                         std::uint64_t& generation) {
         if (!iqStreamBound || !iqStream || sampleCount < 2 || sampleCount > DIRECT_FFT_SIZE ||
             !std::isfinite(sampleRateHz) || sampleRateHz <= 0.0) {
+            {
+                std::lock_guard<std::mutex> lock(iqCaptureMutex);
+                iqLastCaptureCopiedSamples = 0;
+                iqLastCaptureTargetSamples = sampleCount;
+                iqLastCaptureEndReason = IQCaptureEndReason::INVALID_REQUEST;
+                iqLastCaptureGeneration = iqFrameGeneration;
+            }
+            logIQCaptureFailure(snapshotIQCaptureDiagnostics());
             return false;
         }
 
@@ -886,6 +979,10 @@ private:
         std::unique_lock<std::mutex> lock(iqCaptureMutex);
         iqCaptureBuffer.clear();
         iqCaptureTarget = sampleCount;
+        iqLastCaptureCopiedSamples = 0;
+        iqLastCaptureTargetSamples = sampleCount;
+        iqLastCaptureEndReason = IQCaptureEndReason::IN_PROGRESS;
+        iqLastCaptureGeneration = iqFrameGeneration;
         discardNextIQChunk = true;
         const std::uint64_t requestedGeneration = iqFrameGeneration + 1;
         iqCaptureRequested = true;
@@ -897,17 +994,34 @@ private:
             });
         if (!signaled || iqFrameGeneration < requestedGeneration ||
             shuttingDown.load() || !sweepRequested.load()) {
+            iqLastCaptureCopiedSamples = iqCaptureBuffer.size();
+            iqLastCaptureEndReason = (shuttingDown.load() || !sweepRequested.load())
+                                         ? IQCaptureEndReason::CANCELLED
+                                         : IQCaptureEndReason::TIMEOUT;
+            iqLastCaptureGeneration = iqFrameGeneration;
             iqCaptureRequested = false;
             discardNextIQChunk = false;
             iqCaptureTarget = 0;
             iqCaptureBuffer.clear();
+            lock.unlock();
+            logIQCaptureFailure(snapshotIQCaptureDiagnostics());
             return false;
         }
 
         samples = iqCaptureBuffer;
         generation = iqFrameGeneration;
+        iqLastCaptureCopiedSamples = samples.size();
+        iqLastCaptureEndReason = (samples.size() == sampleCount)
+                                     ? IQCaptureEndReason::COMPLETED
+                                     : IQCaptureEndReason::RESULT_MISMATCH;
+        iqLastCaptureGeneration = iqFrameGeneration;
         iqCaptureTarget = 0;
-        return samples.size() == sampleCount;
+        const bool complete = samples.size() == sampleCount;
+        lock.unlock();
+        if (!complete) {
+            logIQCaptureFailure(snapshotIQCaptureDiagnostics());
+        }
+        return complete;
     }
 
     bool computeDirectFFT(const std::vector<dsp::complex_t>& samples,
@@ -1427,6 +1541,7 @@ private:
             debugStats = lastDebugStats;
             segmentDebugStats = currentSegmentDebugStats;
         }
+        const IQCaptureDiagnostics iqDiagnostics = snapshotIQCaptureDiagnostics();
 
         ImGui::Text("Worker active: %s", workerActive.load() ? "yes" : "no");
         ImGui::Text("Working segment: %d / %d", segment, totalSegments);
@@ -1437,6 +1552,17 @@ private:
         ImGui::Text("Sample rate: %.3f MS/s", sampleRateHz / 1e6);
         ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
         ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
+        ImGui::Separator();
+        ImGui::TextUnformatted("IQ capture diagnostic gate");
+        ImGui::Text("Handler calls (valid): %llu", static_cast<unsigned long long>(iqDiagnostics.handlerCalls));
+        ImGui::Text("IQ samples presented to handler: %llu", static_cast<unsigned long long>(iqDiagnostics.handlerSamples));
+        ImGui::Text("Handler calls during capture request: %llu", static_cast<unsigned long long>(iqDiagnostics.requestedHandlerCalls));
+        ImGui::Text("IQ samples during capture request: %llu", static_cast<unsigned long long>(iqDiagnostics.requestedHandlerSamples));
+        ImGui::Text("Intentionally discarded chunks: %llu", static_cast<unsigned long long>(iqDiagnostics.discardedChunks));
+        ImGui::Text("IQ samples copied: %zu / %zu", iqDiagnostics.copiedSamples, iqDiagnostics.targetSamples);
+        ImGui::Text("Last handler chunk size: %d", iqDiagnostics.lastHandlerChunkSize);
+        ImGui::Text("Last capture result: %s", iqCaptureEndReasonText(iqDiagnostics.endReason));
+        ImGui::Text("IQ frame generation at attempt end: %llu", static_cast<unsigned long long>(iqDiagnostics.generation));
         ImGui::Separator();
         ImGui::TextUnformatted("FFT source: private operation-bound IQFrontEnd stream");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
@@ -1585,11 +1711,21 @@ private:
     bool iqStreamBound = false;
     std::mutex iqCaptureMutex;
     std::condition_variable iqCaptureCv;
+    std::atomic<std::uint64_t> iqHandlerCalls{ 0 };
+    std::atomic<std::uint64_t> iqHandlerSamples{ 0 };
+    std::atomic<std::uint64_t> iqRequestedHandlerCalls{ 0 };
+    std::atomic<std::uint64_t> iqRequestedHandlerSamples{ 0 };
+    std::atomic<std::uint64_t> iqDiscardedChunks{ 0 };
+    std::atomic<int> iqLastHandlerChunkSize{ 0 };
     std::vector<dsp::complex_t> iqCaptureBuffer;
     std::size_t iqCaptureTarget = 0;
     bool iqCaptureRequested = false;
     bool discardNextIQChunk = false;
     std::uint64_t iqFrameGeneration = 0;
+    std::size_t iqLastCaptureCopiedSamples = 0;
+    std::size_t iqLastCaptureTargetSamples = 0;
+    IQCaptureEndReason iqLastCaptureEndReason = IQCaptureEndReason::NONE;
+    std::uint64_t iqLastCaptureGeneration = 0;
 
     fftwf_complex* directFFTIn = nullptr;
     fftwf_complex* directFFTOut = nullptr;
