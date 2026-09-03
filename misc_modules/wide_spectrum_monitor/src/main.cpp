@@ -164,6 +164,15 @@ namespace {
     };
 
     struct IQCaptureDiagnostics {
+        std::uint64_t pathCreationAttempts = 0;
+        bool privateStreamAllocated = false;
+        bool bindCompleted = false;
+        bool sinkInitialized = false;
+        bool sinkStarted = false;
+        bool frontendPlaying = false;
+        std::uintptr_t privateStreamAddress = 0;
+        std::uintptr_t sinkInputAddress = 0;
+        std::uintptr_t boundStreamAddress = 0;
         std::uint64_t handlerCalls = 0;
         std::uint64_t handlerSamples = 0;
         std::uint64_t requestedHandlerCalls = 0;
@@ -365,7 +374,7 @@ class WideSpectrumMonitorModule : public ModuleManager::Instance {
 public:
     explicit WideSpectrumMonitorModule(std::string instanceName) : name(std::move(instanceName)) {
         loadConfig();
-        iqSink.init(nullptr, iqStreamHandler, this);
+        iqFrontendCurrentlyPlaying.store(gui::mainWindow.sdrIsRunning(), std::memory_order_relaxed);
 
         if (initializeDirectFFT()) {
             iqCaptureBuffer.reserve(DIRECT_FFT_SIZE);
@@ -427,8 +436,10 @@ private:
     }
 
     static void playStateChanged(bool playing, void* ctx) {
+        auto* instance = static_cast<WideSpectrumMonitorModule*>(ctx);
+        instance->iqFrontendCurrentlyPlaying.store(playing, std::memory_order_relaxed);
         if (!playing) {
-            static_cast<WideSpectrumMonitorModule*>(ctx)->requestStop("Stopped (SDR source is not running)");
+            instance->requestStop("Stopped (SDR source is not running)");
         }
     }
 
@@ -480,6 +491,15 @@ private:
 
     IQCaptureDiagnostics snapshotIQCaptureDiagnostics() {
         IQCaptureDiagnostics diagnostics;
+        diagnostics.pathCreationAttempts = iqCapturePathCreationAttempts.load(std::memory_order_relaxed);
+        diagnostics.privateStreamAllocated = iqLastPathStreamAllocated.load(std::memory_order_relaxed);
+        diagnostics.bindCompleted = iqLastPathBindCompleted.load(std::memory_order_relaxed);
+        diagnostics.sinkInitialized = iqLastPathSinkInitialized.load(std::memory_order_relaxed);
+        diagnostics.sinkStarted = iqLastPathSinkStarted.load(std::memory_order_relaxed);
+        diagnostics.frontendPlaying = iqFrontendCurrentlyPlaying.load(std::memory_order_relaxed);
+        diagnostics.privateStreamAddress = iqLastPrivateStreamAddress.load(std::memory_order_relaxed);
+        diagnostics.sinkInputAddress = iqLastSinkInputAddress.load(std::memory_order_relaxed);
+        diagnostics.boundStreamAddress = iqLastBoundStreamAddress.load(std::memory_order_relaxed);
         diagnostics.handlerCalls = iqHandlerCalls.load(std::memory_order_relaxed);
         diagnostics.handlerSamples = iqHandlerSamples.load(std::memory_order_relaxed);
         diagnostics.requestedHandlerCalls = iqRequestedHandlerCalls.load(std::memory_order_relaxed);
@@ -498,10 +518,13 @@ private:
 
     void logIQCaptureFailure(const IQCaptureDiagnostics& diagnostics) {
         flog::error(
-            "Wide Spectrum Monitor: IQ capture failed: reason={}, handler_calls={}, handler_samples={}, "
+            "Wide Spectrum Monitor: IQ capture failed: reason={}, path_attempts={}, allocated={}, bound={}, "
+            "sink_initialized={}, sink_started={}, frontend_playing={}, handler_calls={}, handler_samples={}, "
             "request_calls={}, request_samples={}, discarded_chunks={}, copied={}/{}, last_chunk={}, generation={}",
-            iqCaptureEndReasonText(diagnostics.endReason), diagnostics.handlerCalls,
-            diagnostics.handlerSamples, diagnostics.requestedHandlerCalls,
+            iqCaptureEndReasonText(diagnostics.endReason), diagnostics.pathCreationAttempts,
+            diagnostics.privateStreamAllocated, diagnostics.bindCompleted,
+            diagnostics.sinkInitialized, diagnostics.sinkStarted, diagnostics.frontendPlaying,
+            diagnostics.handlerCalls, diagnostics.handlerSamples, diagnostics.requestedHandlerCalls,
             diagnostics.requestedHandlerSamples, diagnostics.discardedChunks,
             diagnostics.copiedSamples, diagnostics.targetSamples,
             diagnostics.lastHandlerChunkSize, diagnostics.generation);
@@ -509,25 +532,42 @@ private:
 
     bool startIQCapturePath() {
         stopIQCapturePath();
+        iqCapturePathCreationAttempts.fetch_add(1, std::memory_order_relaxed);
+        iqLastPathStreamAllocated.store(false, std::memory_order_relaxed);
+        iqLastPathBindCompleted.store(false, std::memory_order_relaxed);
+        iqLastPathSinkInitialized.store(false, std::memory_order_relaxed);
+        iqLastPathSinkStarted.store(false, std::memory_order_relaxed);
+        iqLastPrivateStreamAddress.store(0, std::memory_order_relaxed);
+        iqLastSinkInputAddress.store(0, std::memory_order_relaxed);
+        iqLastBoundStreamAddress.store(0, std::memory_order_relaxed);
+        iqFrontendCurrentlyPlaying.store(gui::mainWindow.sdrIsRunning(), std::memory_order_relaxed);
 
         try {
             iqStream = new dsp::stream<dsp::complex_t>();
-            iqSink.setInput(iqStream);
-            iqSink.start();
+            iqLastPrivateStreamAddress.store(reinterpret_cast<std::uintptr_t>(iqStream), std::memory_order_relaxed);
+            iqLastPathStreamAllocated.store(true, std::memory_order_relaxed);
+
+            iqLastBoundStreamAddress.store(reinterpret_cast<std::uintptr_t>(iqStream), std::memory_order_relaxed);
             sigpath::iqFrontEnd.bindIQStream(iqStream);
             iqStreamBound = true;
+            iqLastPathBindCompleted.store(true, std::memory_order_relaxed);
+
+            iqSink = new dsp::sink::Handler<dsp::complex_t>();
+            iqLastSinkInputAddress.store(reinterpret_cast<std::uintptr_t>(iqStream), std::memory_order_relaxed);
+            iqSink->init(iqStream, iqStreamHandler, this);
+            iqSinkInitialized = true;
+            iqLastPathSinkInitialized.store(true, std::memory_order_relaxed);
+
+            iqSink->start();
+            iqLastPathSinkStarted.store(true, std::memory_order_relaxed);
         }
         catch (const std::exception& e) {
-            iqSink.stop();
-            delete iqStream;
-            iqStream = nullptr;
+            stopIQCapturePath();
             flog::error("Wide Spectrum Monitor: Could not start IQ capture path: {}", e.what());
             return false;
         }
         catch (...) {
-            iqSink.stop();
-            delete iqStream;
-            iqStream = nullptr;
+            stopIQCapturePath();
             flog::error("Wide Spectrum Monitor: Could not start IQ capture path");
             return false;
         }
@@ -535,11 +575,16 @@ private:
     }
 
     void stopIQCapturePath() {
+        if (iqSink && iqSinkInitialized) {
+            iqSink->stop();
+        }
         if (iqStreamBound) {
             sigpath::iqFrontEnd.unbindIQStream(iqStream);
             iqStreamBound = false;
         }
-        iqSink.stop();
+        delete iqSink;
+        iqSink = nullptr;
+        iqSinkInitialized = false;
         delete iqStream;
         iqStream = nullptr;
     }
@@ -695,7 +740,9 @@ private:
             setError("Sweep worker is unavailable");
             return;
         }
-        if (!gui::mainWindow.sdrIsRunning()) {
+        const bool frontendPlaying = gui::mainWindow.sdrIsRunning();
+        iqFrontendCurrentlyPlaying.store(frontendPlaying, std::memory_order_relaxed);
+        if (!frontendPlaying) {
             setError("Start the SDR source before starting a sweep");
             return;
         }
@@ -1553,7 +1600,16 @@ private:
         ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
         ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
         ImGui::Separator();
-        ImGui::TextUnformatted("IQ capture diagnostic gate");
+        ImGui::TextUnformatted("V10 IQ capture lifecycle");
+        ImGui::Text("Capture path creation attempts: %llu", static_cast<unsigned long long>(iqDiagnostics.pathCreationAttempts));
+        ImGui::Text("Private stream allocated: %s", iqDiagnostics.privateStreamAllocated ? "yes" : "no");
+        ImGui::Text("bindIQStream completed: %s", iqDiagnostics.bindCompleted ? "yes" : "no");
+        ImGui::Text("Sink initialized with private stream: %s", iqDiagnostics.sinkInitialized ? "yes" : "no");
+        ImGui::Text("Sink started: %s", iqDiagnostics.sinkStarted ? "yes" : "no");
+        ImGui::Text("Frontend currently playing: %s", iqDiagnostics.frontendPlaying ? "yes" : "no");
+        ImGui::Text("Private IQ stream pointer: 0x%llX", static_cast<unsigned long long>(iqDiagnostics.privateStreamAddress));
+        ImGui::Text("Sink input pointer: 0x%llX", static_cast<unsigned long long>(iqDiagnostics.sinkInputAddress));
+        ImGui::Text("bindIQStream pointer: 0x%llX", static_cast<unsigned long long>(iqDiagnostics.boundStreamAddress));
         ImGui::Text("Handler calls (valid): %llu", static_cast<unsigned long long>(iqDiagnostics.handlerCalls));
         ImGui::Text("IQ samples presented to handler: %llu", static_cast<unsigned long long>(iqDiagnostics.handlerSamples));
         ImGui::Text("Handler calls during capture request: %llu", static_cast<unsigned long long>(iqDiagnostics.requestedHandlerCalls));
@@ -1564,7 +1620,7 @@ private:
         ImGui::Text("Last capture result: %s", iqCaptureEndReasonText(iqDiagnostics.endReason));
         ImGui::Text("IQ frame generation at attempt end: %llu", static_cast<unsigned long long>(iqDiagnostics.generation));
         ImGui::Separator();
-        ImGui::TextUnformatted("FFT source: private operation-bound IQFrontEnd stream");
+        ImGui::TextUnformatted("FFT source: private IQFrontEnd stream (V10 lifecycle)");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
         ImGui::Text("Direct FFT bin count: %zu", segmentDebugStats.rawFftBinCount);
         ImGui::Text("IQ samples per FFT frame: %zu", segmentDebugStats.iqSamplesPerFrame);
@@ -1707,10 +1763,20 @@ private:
     SweepSettings queuedSettings;
 
     dsp::stream<dsp::complex_t>* iqStream = nullptr;
-    dsp::sink::Handler<dsp::complex_t> iqSink;
+    dsp::sink::Handler<dsp::complex_t>* iqSink = nullptr;
+    bool iqSinkInitialized = false;
     bool iqStreamBound = false;
     std::mutex iqCaptureMutex;
     std::condition_variable iqCaptureCv;
+    std::atomic<std::uint64_t> iqCapturePathCreationAttempts{ 0 };
+    std::atomic<bool> iqLastPathStreamAllocated{ false };
+    std::atomic<bool> iqLastPathBindCompleted{ false };
+    std::atomic<bool> iqLastPathSinkInitialized{ false };
+    std::atomic<bool> iqLastPathSinkStarted{ false };
+    std::atomic<bool> iqFrontendCurrentlyPlaying{ false };
+    std::atomic<std::uintptr_t> iqLastPrivateStreamAddress{ 0 };
+    std::atomic<std::uintptr_t> iqLastSinkInputAddress{ 0 };
+    std::atomic<std::uintptr_t> iqLastBoundStreamAddress{ 0 };
     std::atomic<std::uint64_t> iqHandlerCalls{ 0 };
     std::atomic<std::uint64_t> iqHandlerSamples{ 0 };
     std::atomic<std::uint64_t> iqRequestedHandlerCalls{ 0 };
