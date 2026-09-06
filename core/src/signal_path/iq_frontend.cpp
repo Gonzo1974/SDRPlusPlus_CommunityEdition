@@ -39,6 +39,7 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     preproc.addBlock(&conjugate, false); // TODO: Replace by parameter
 
     split.init(preproc.out);
+    split.setDiagnosticsState(&splitDiagnostics);
 
     // TODO: Do something to avoid basically repeating this code twice
     int skip;
@@ -115,18 +116,18 @@ void IQFrontEnd::setDecimation(int ratio) {
     decim.tempStart();
 
     // Enable or disable in the chain
-    preproc.setBlockEnabled(&decim, _decimRatio > 1, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
+    preproc.setBlockEnabled(&decim, _decimRatio > 1, [=](dsp::stream<dsp::complex_t>* out) { split.setInput(out); });
 
     // Update the DSP sample rate (TODO: Find a way to get rid of this)
     core::setInputSampleRate(_sampleRate);
 }
 
 void IQFrontEnd::setDCBlocking(bool enabled) {
-    preproc.setBlockEnabled(&dcBlock, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
+    preproc.setBlockEnabled(&dcBlock, enabled, [=](dsp::stream<dsp::complex_t>* out) { split.setInput(out); });
 }
 
 void IQFrontEnd::setInvertIQ(bool enabled) {
-    preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
+    preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out) { split.setInput(out); });
 }
 
 void IQFrontEnd::bindIQStream(dsp::stream<dsp::complex_t>* stream) {
@@ -135,6 +136,18 @@ void IQFrontEnd::bindIQStream(dsp::stream<dsp::complex_t>* stream) {
 
 void IQFrontEnd::unbindIQStream(dsp::stream<dsp::complex_t>* stream) {
     split.unbindStream(stream);
+}
+
+void IQFrontEnd::setSplitterDiagnosticsEnabled(bool enabled) {
+    split.setDiagnosticsEnabled(enabled);
+}
+
+dsp::routing::SplitterDiagnosticsSnapshot IQFrontEnd::getSplitterDiagnosticsSnapshot() const {
+    return split.getDiagnosticsSnapshot();
+}
+
+std::uintptr_t IQFrontEnd::getFFTInputStreamAddress() const {
+    return reinterpret_cast<std::uintptr_t>(&fftIn);
 }
 
 dsp::channel::RxVFO* IQFrontEnd::addVFO(std::string name, double sampleRate, double bandwidth, double offset) {

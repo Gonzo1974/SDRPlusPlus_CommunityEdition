@@ -185,6 +185,11 @@ namespace {
         std::uint64_t generation = 0;
     };
 
+    struct SplitterDiagnosticCheckpoint {
+        bool captured = false;
+        dsp::routing::SplitterDiagnosticsSnapshot snapshot;
+    };
+
     enum class PendingTuneReason {
         NONE,
         RESTORE_AFTER_STOP,
@@ -208,6 +213,20 @@ namespace {
         case IQCaptureEndReason::NONE:
         default:
             return "no capture attempt";
+        }
+    }
+
+    const char* splitterDiagnosticPhaseText(dsp::routing::SplitterDiagnosticPhase phase) {
+        switch (phase) {
+        case dsp::routing::SplitterDiagnosticPhase::BEFORE_MEMCPY:
+            return "BEFORE_MEMCPY";
+        case dsp::routing::SplitterDiagnosticPhase::BEFORE_SWAP:
+            return "BEFORE_SWAP";
+        case dsp::routing::SplitterDiagnosticPhase::AFTER_SWAP:
+            return "AFTER_SWAP";
+        case dsp::routing::SplitterDiagnosticPhase::IDLE:
+        default:
+            return "IDLE";
         }
     }
 
@@ -375,6 +394,7 @@ public:
     explicit WideSpectrumMonitorModule(std::string instanceName) : name(std::move(instanceName)) {
         loadConfig();
         iqFrontendCurrentlyPlaying.store(gui::mainWindow.sdrIsRunning(), std::memory_order_relaxed);
+        sigpath::iqFrontEnd.setSplitterDiagnosticsEnabled(true);
 
         if (initializeDirectFFT()) {
             iqCaptureBuffer.reserve(DIRECT_FFT_SIZE);
@@ -411,6 +431,7 @@ public:
             workerThread.join();
         }
         stopIQCapturePath();
+        sigpath::iqFrontEnd.setSplitterDiagnosticsEnabled(false);
         releaseDirectFFT();
         gui::menu.removeEntry(name);
     }
@@ -530,8 +551,31 @@ private:
             diagnostics.lastHandlerChunkSize, diagnostics.generation);
     }
 
+    void resetSplitterDiagnosticCheckpoints() {
+        std::lock_guard<std::mutex> lock(splitterCheckpointMutex);
+        beforePrivateBindCheckpoint = {};
+        afterPrivateBindCheckpoint = {};
+        beforeFirstTuneCheckpoint = {};
+        immediatelyAfterFirstTuneCheckpoint = {};
+        afterFirstTuneSettlingCheckpoint = {};
+        captureTimeoutCheckpoint = {};
+    }
+
+    void captureSplitterDiagnosticCheckpoint(SplitterDiagnosticCheckpoint& checkpoint,
+                                             bool onlyIfUnset = false) {
+        const dsp::routing::SplitterDiagnosticsSnapshot snapshot =
+            sigpath::iqFrontEnd.getSplitterDiagnosticsSnapshot();
+        std::lock_guard<std::mutex> lock(splitterCheckpointMutex);
+        if (onlyIfUnset && checkpoint.captured) {
+            return;
+        }
+        checkpoint.captured = true;
+        checkpoint.snapshot = snapshot;
+    }
+
     bool startIQCapturePath() {
         stopIQCapturePath();
+        resetSplitterDiagnosticCheckpoints();
         iqCapturePathCreationAttempts.fetch_add(1, std::memory_order_relaxed);
         iqLastPathStreamAllocated.store(false, std::memory_order_relaxed);
         iqLastPathBindCompleted.store(false, std::memory_order_relaxed);
@@ -541,6 +585,7 @@ private:
         iqLastSinkInputAddress.store(0, std::memory_order_relaxed);
         iqLastBoundStreamAddress.store(0, std::memory_order_relaxed);
         iqFrontendCurrentlyPlaying.store(gui::mainWindow.sdrIsRunning(), std::memory_order_relaxed);
+        captureSplitterDiagnosticCheckpoint(beforePrivateBindCheckpoint);
 
         try {
             iqStream = new dsp::stream<dsp::complex_t>();
@@ -551,6 +596,7 @@ private:
             sigpath::iqFrontEnd.bindIQStream(iqStream);
             iqStreamBound = true;
             iqLastPathBindCompleted.store(true, std::memory_order_relaxed);
+            captureSplitterDiagnosticCheckpoint(afterPrivateBindCheckpoint);
 
             iqSink = new dsp::sink::Handler<dsp::complex_t>();
             iqLastSinkInputAddress.store(reinterpret_cast<std::uintptr_t>(iqStream), std::memory_order_relaxed);
@@ -913,9 +959,18 @@ private:
                     statusText = "Settling";
                 }
 
+                if (segmentIndex == 0) {
+                    captureSplitterDiagnosticCheckpoint(beforeFirstTuneCheckpoint, true);
+                }
                 sigpath::sourceManager.tune(centerHz);
+                if (segmentIndex == 0) {
+                    captureSplitterDiagnosticCheckpoint(immediatelyAfterFirstTuneCheckpoint, true);
+                }
                 if (!waitFor(std::chrono::milliseconds(settings.tuningTimeMs))) {
                     break;
+                }
+                if (segmentIndex == 0) {
+                    captureSplitterDiagnosticCheckpoint(afterFirstTuneSettlingCheckpoint, true);
                 }
 
                 SegmentDebugStats segmentDebugStats;
@@ -1045,12 +1100,16 @@ private:
             iqLastCaptureEndReason = (shuttingDown.load() || !sweepRequested.load())
                                          ? IQCaptureEndReason::CANCELLED
                                          : IQCaptureEndReason::TIMEOUT;
+            const bool captureTimedOut = iqLastCaptureEndReason == IQCaptureEndReason::TIMEOUT;
             iqLastCaptureGeneration = iqFrameGeneration;
             iqCaptureRequested = false;
             discardNextIQChunk = false;
             iqCaptureTarget = 0;
             iqCaptureBuffer.clear();
             lock.unlock();
+            if (captureTimedOut) {
+                captureSplitterDiagnosticCheckpoint(captureTimeoutCheckpoint);
+            }
             logIQCaptureFailure(snapshotIQCaptureDiagnostics());
             return false;
         }
@@ -1558,6 +1617,65 @@ private:
         ImGui::TextDisabled("Tap a row to stop the sweep and tune SDR++.");
     }
 
+    static const char* splitterOutputRole(std::uintptr_t streamAddress,
+                                          std::uintptr_t fftInputAddress,
+                                          std::uintptr_t privateStreamAddress) {
+        if (streamAddress != 0 && streamAddress == fftInputAddress) {
+            return "fftIn";
+        }
+        if (streamAddress != 0 && streamAddress == privateStreamAddress) {
+            return "WSM private";
+        }
+        return "VFO/other";
+    }
+
+    static void drawSplitterDiagnosticCheckpoint(
+        const char* label, const SplitterDiagnosticCheckpoint& checkpoint,
+        std::uintptr_t fftInputAddress, std::uintptr_t privateStreamAddress) {
+        if (!ImGui::TreeNodeEx(label, ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+        if (!checkpoint.captured) {
+            ImGui::TextUnformatted("Snapshot not captured");
+            ImGui::TreePop();
+            return;
+        }
+
+        const dsp::routing::SplitterDiagnosticsSnapshot& snapshot = checkpoint.snapshot;
+        ImGui::Text("Diagnostics enabled: %s", snapshot.enabled ? "yes" : "no");
+        ImGui::Text("Splitter runs / input samples: %llu / %llu",
+                    static_cast<unsigned long long>(snapshot.runCalls),
+                    static_cast<unsigned long long>(snapshot.inputSamples));
+        ImGui::Text("Registered / tracked outputs: %zu / %zu", snapshot.outputCount,
+                    snapshot.trackedOutputCount);
+        ImGui::Text("Completed runs / last completed run: %llu / %llu",
+                    static_cast<unsigned long long>(snapshot.completedRuns),
+                    static_cast<unsigned long long>(snapshot.lastCompletedRun));
+        ImGui::Text("Current output: %d @ 0x%llX (%s)", snapshot.currentOutputIndex,
+                    static_cast<unsigned long long>(snapshot.currentOutputAddress),
+                    splitterDiagnosticPhaseText(snapshot.phase));
+        ImGui::Text("Last incomplete run/output: %llu / %d @ 0x%llX",
+                    static_cast<unsigned long long>(snapshot.lastIncompleteRun),
+                    snapshot.lastIncompleteOutputIndex,
+                    static_cast<unsigned long long>(snapshot.lastIncompleteOutputAddress));
+
+        const std::size_t trackedCount = std::min(
+            snapshot.trackedOutputCount, dsp::routing::SPLITTER_DIAGNOSTIC_MAX_OUTPUTS);
+        for (std::size_t outputIndex = 0; outputIndex < trackedCount; ++outputIndex) {
+            const dsp::routing::SplitterOutputDiagnosticsSnapshot& output =
+                snapshot.outputs[outputIndex];
+            ImGui::TextWrapped(
+                "Output %zu [%s] 0x%llX: attempts=%llu, swaps=%llu, samples=%llu",
+                outputIndex,
+                splitterOutputRole(output.streamAddress, fftInputAddress, privateStreamAddress),
+                static_cast<unsigned long long>(output.streamAddress),
+                static_cast<unsigned long long>(output.writeAttempts),
+                static_cast<unsigned long long>(output.successfulSwaps),
+                static_cast<unsigned long long>(output.samplesOffered));
+        }
+        ImGui::TreePop();
+    }
+
     void drawDebugInfo() {
         if (!ImGui::CollapsingHeader(("Debug##wsm_debug_" + name).c_str())) {
             return;
@@ -1589,6 +1707,22 @@ private:
             segmentDebugStats = currentSegmentDebugStats;
         }
         const IQCaptureDiagnostics iqDiagnostics = snapshotIQCaptureDiagnostics();
+        SplitterDiagnosticCheckpoint beforePrivateBind;
+        SplitterDiagnosticCheckpoint afterPrivateBind;
+        SplitterDiagnosticCheckpoint beforeFirstTune;
+        SplitterDiagnosticCheckpoint immediatelyAfterFirstTune;
+        SplitterDiagnosticCheckpoint afterFirstTuneSettling;
+        SplitterDiagnosticCheckpoint captureTimeout;
+        {
+            std::lock_guard<std::mutex> lock(splitterCheckpointMutex);
+            beforePrivateBind = beforePrivateBindCheckpoint;
+            afterPrivateBind = afterPrivateBindCheckpoint;
+            beforeFirstTune = beforeFirstTuneCheckpoint;
+            immediatelyAfterFirstTune = immediatelyAfterFirstTuneCheckpoint;
+            afterFirstTuneSettling = afterFirstTuneSettlingCheckpoint;
+            captureTimeout = captureTimeoutCheckpoint;
+        }
+        const std::uintptr_t fftInputAddress = sigpath::iqFrontEnd.getFFTInputStreamAddress();
 
         ImGui::Text("Worker active: %s", workerActive.load() ? "yes" : "no");
         ImGui::Text("Working segment: %d / %d", segment, totalSegments);
@@ -1619,6 +1753,26 @@ private:
         ImGui::Text("Last handler chunk size: %d", iqDiagnostics.lastHandlerChunkSize);
         ImGui::Text("Last capture result: %s", iqCaptureEndReasonText(iqDiagnostics.endReason));
         ImGui::Text("IQ frame generation at attempt end: %llu", static_cast<unsigned long long>(iqDiagnostics.generation));
+        ImGui::Separator();
+        ImGui::TextUnformatted("V11 IQFrontend splitter blocking diagnostic");
+        ImGui::Text("Known fftIn stream pointer: 0x%llX",
+                    static_cast<unsigned long long>(fftInputAddress));
+        ImGui::Text("Known WSM stream pointer: 0x%llX",
+                    static_cast<unsigned long long>(iqDiagnostics.privateStreamAddress));
+        drawSplitterDiagnosticCheckpoint("Before private bind", beforePrivateBind,
+                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
+        drawSplitterDiagnosticCheckpoint("After private bind", afterPrivateBind,
+                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
+        drawSplitterDiagnosticCheckpoint("Before first sweep tune", beforeFirstTune,
+                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
+        drawSplitterDiagnosticCheckpoint("Immediately after first sweep tune",
+                                         immediatelyAfterFirstTune, fftInputAddress,
+                                         iqDiagnostics.privateStreamAddress);
+        drawSplitterDiagnosticCheckpoint("After first sweep tune settling",
+                                         afterFirstTuneSettling, fftInputAddress,
+                                         iqDiagnostics.privateStreamAddress);
+        drawSplitterDiagnosticCheckpoint("At capture timeout", captureTimeout,
+                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
         ImGui::Separator();
         ImGui::TextUnformatted("FFT source: private IQFrontEnd stream (V10 lifecycle)");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
@@ -1766,6 +1920,13 @@ private:
     dsp::sink::Handler<dsp::complex_t>* iqSink = nullptr;
     bool iqSinkInitialized = false;
     bool iqStreamBound = false;
+    std::mutex splitterCheckpointMutex;
+    SplitterDiagnosticCheckpoint beforePrivateBindCheckpoint;
+    SplitterDiagnosticCheckpoint afterPrivateBindCheckpoint;
+    SplitterDiagnosticCheckpoint beforeFirstTuneCheckpoint;
+    SplitterDiagnosticCheckpoint immediatelyAfterFirstTuneCheckpoint;
+    SplitterDiagnosticCheckpoint afterFirstTuneSettlingCheckpoint;
+    SplitterDiagnosticCheckpoint captureTimeoutCheckpoint;
     std::mutex iqCaptureMutex;
     std::condition_variable iqCaptureCv;
     std::atomic<std::uint64_t> iqCapturePathCreationAttempts{ 0 };

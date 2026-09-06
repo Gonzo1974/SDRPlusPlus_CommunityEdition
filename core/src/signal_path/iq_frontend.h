@@ -34,6 +34,10 @@ public:
     void bindIQStream(dsp::stream<dsp::complex_t>* stream);
     void unbindIQStream(dsp::stream<dsp::complex_t>* stream);
 
+    void setSplitterDiagnosticsEnabled(bool enabled);
+    dsp::routing::SplitterDiagnosticsSnapshot getSplitterDiagnosticsSnapshot() const;
+    std::uintptr_t getFFTInputStreamAddress() const;
+
     dsp::channel::RxVFO* addVFO(std::string name, double sampleRate, double bandwidth, double offset);
     void removeVFO(std::string name);
 
@@ -72,6 +76,7 @@ protected:
     dsp::chain<dsp::complex_t> preproc;
 
     // Splitting
+    dsp::routing::SplitterDiagnosticsState splitDiagnostics;
     dsp::routing::Splitter<dsp::complex_t> split;
 
     // FFT
@@ -103,5 +108,4 @@ protected:
     double effectiveSr;
 
     bool _init = false;
-
 };
