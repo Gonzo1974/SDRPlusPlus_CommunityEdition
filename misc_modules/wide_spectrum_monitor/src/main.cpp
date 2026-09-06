@@ -46,6 +46,10 @@ namespace {
     constexpr double DIRECT_FFT_RATE = 20.0;
     constexpr int MIN_IQ_CAPTURE_TIMEOUT_MS = 2000;
     constexpr std::size_t MAX_SEGMENT_COUNT = 4096;
+    constexpr std::size_t V12_RAW_GRAPH_POINT_COUNT = 2048;
+    constexpr std::size_t V12_FIXED_SAMPLE_COUNT = 15;
+    constexpr std::size_t V12_PERIODICITY_COUNT = 8;
+    constexpr std::size_t V12_WIDE_SAMPLE_COUNT = 16;
     constexpr double USABLE_BANDWIDTH_RATIO = 0.85;
     constexpr float GRAPH_MIN_DB = -120.0f;
     constexpr float GRAPH_MAX_DB = 0.0f;
@@ -188,6 +192,98 @@ namespace {
     struct SplitterDiagnosticCheckpoint {
         bool captured = false;
         dsp::routing::SplitterDiagnosticsSnapshot snapshot;
+    };
+
+    struct RawFFTFixedSample {
+        std::size_t bin = 0;
+        double offsetHz = 0.0;
+        float valueDbfs = NO_DATA_DBFS;
+    };
+
+    struct FFTPeriodicityDiagnostic {
+        std::size_t periodBins = 0;
+        double periodHz = 0.0;
+        double score = std::numeric_limits<double>::quiet_NaN();
+        double meanAbsoluteDifferenceDb = std::numeric_limits<double>::quiet_NaN();
+        std::size_t comparedPairs = 0;
+    };
+
+    struct FFTFrameComparison {
+        bool available = false;
+        std::size_t comparedBins = 0;
+        double meanAbsoluteDifferenceDb = std::numeric_limits<double>::quiet_NaN();
+        double withinOneDbPercent = 0.0;
+        double withinThreeDbPercent = 0.0;
+    };
+
+    struct WideBinContributionSample {
+        std::size_t wideBinIndex = 0;
+        double frequencyHz = 0.0;
+        std::size_t contributingRawBins = 0;
+        float selectedMaximumDbfs = NO_DATA_DBFS;
+        float highestRawDbfs = NO_DATA_DBFS;
+        float secondHighestRawDbfs = NO_DATA_DBFS;
+    };
+
+    struct SegmentContributionDiagnostics {
+        double centerHz = 0.0;
+        double rawStartHz = 0.0;
+        double rawStopHz = 0.0;
+        double usableStartHz = 0.0;
+        double usableStopHz = 0.0;
+        std::size_t rawBinsUsed = 0;
+        std::size_t wideBinsHit = 0;
+        std::size_t wideBinsWithMultipleRawBins = 0;
+        std::size_t minimumRawBinsPerWideBin = 0;
+        std::size_t maximumRawBinsPerWideBin = 0;
+        double averageRawBinsPerWideBin = 0.0;
+        std::size_t samplesWritten = 0;
+        WideBinContributionSample samples[V12_WIDE_SAMPLE_COUNT];
+    };
+
+    struct SpectrumArtifactDiagnostics {
+        bool available = false;
+        int segmentNumber = 0;
+        double centerHz = 0.0;
+        double sampleRateHz = 0.0;
+        std::size_t rawBinCount = 0;
+        std::size_t validRawBinCount = 0;
+        float rawMinimumDbfs = NO_DATA_DBFS;
+        float rawMaximumDbfs = NO_DATA_DBFS;
+        double rawMeanDbfs = std::numeric_limits<double>::quiet_NaN();
+        double rawMedianDbfs = std::numeric_limits<double>::quiet_NaN();
+        double rawStandardDeviationDb = std::numeric_limits<double>::quiet_NaN();
+        double estimatedNoiseFloorDbfs = std::numeric_limits<double>::quiet_NaN();
+        std::size_t localPeaksAboveSixDb = 0;
+        std::size_t localPeaksAboveTenDb = 0;
+        double averagePeakSpacingBins = std::numeric_limits<double>::quiet_NaN();
+        std::size_t dominantPeakSpacingBins = 0;
+        double dominantPeakSpacingHz = 0.0;
+        std::size_t strongestPeriodBins = 0;
+        double strongestPeriodHz = 0.0;
+        double strongestPeriodScore = std::numeric_limits<double>::quiet_NaN();
+        std::size_t fixedSamplesWritten = 0;
+        RawFFTFixedSample fixedSamples[V12_FIXED_SAMPLE_COUNT];
+        FFTPeriodicityDiagnostic periodicity[V12_PERIODICITY_COUNT];
+        std::size_t consistencyFrameCount = 0;
+        FFTFrameComparison frameOneToTwo;
+        FFTFrameComparison frameTwoToThree;
+        SegmentContributionDiagnostics contribution;
+        std::size_t maxMeanComparableBins = 0;
+        double averageMaxMinusMeanDb = std::numeric_limits<double>::quiet_NaN();
+        double maxMinusMeanAboveThreeDbPercent = 0.0;
+        double maxMinusMeanAboveSixDbPercent = 0.0;
+        std::vector<float> rawFFTDisplay;
+        std::vector<float> mergedWideMaximum;
+        std::vector<float> mergedWideMean;
+    };
+
+    struct SegmentBoundaryDiagnostic {
+        double usableStartHz = 0.0;
+        double usableStopHz = 0.0;
+        bool hasOverlap = false;
+        double overlapStartHz = 0.0;
+        double overlapStopHz = 0.0;
     };
 
     enum class PendingTuneReason {
@@ -837,6 +933,8 @@ private:
             currentSegment = 0;
             segmentCount = 0;
             currentSegmentDebugStats = {};
+            currentArtifactDiagnostics = {};
+            activeSegmentBoundaries.clear();
         }
         sweepRequested.store(true);
         requestCv.notify_all();
@@ -934,6 +1032,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             segmentCount = static_cast<int>(centers.size());
+            activeSegmentBoundaries = buildSegmentBoundaries(settings, centers);
             statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
         }
 
@@ -941,6 +1040,7 @@ private:
             // These buffers live for the entire sweep. Segments only merge into
             // them; neither buffer is reset inside the segment loop.
             std::vector<float> cycleSpectrum(WIDE_BIN_COUNT, NO_DATA_DBFS);
+            std::vector<float> cycleMeanSpectrum(WIDE_BIN_COUNT, NO_DATA_DBFS);
             std::vector<float> cycleQuality(WIDE_BIN_COUNT, -1.0f);
             SpectrumDebugStats cycleDebugStats;
             bool capturedAnySegment = false;
@@ -976,8 +1076,10 @@ private:
                 SegmentDebugStats segmentDebugStats;
                 segmentDebugStats.segmentNumber = static_cast<int>(segmentIndex) + 1;
                 std::vector<float> averagedFFT;
+                SpectrumArtifactDiagnostics artifactDiagnostics;
                 if (!captureAveragedFFT(settings.fftAveraging, settings.sampleRateHz,
-                                        averagedFFT, cycleDebugStats, segmentDebugStats)) {
+                                        centerHz, averagedFFT, cycleDebugStats,
+                                        segmentDebugStats, artifactDiagnostics)) {
                     if (!sweepRequested.load() || shuttingDown.load()) {
                         break;
                     }
@@ -986,7 +1088,8 @@ private:
                 }
 
                 segmentDebugStats.wideBinsWritten = mergeSegment(
-                    settings, centerHz, averagedFFT, cycleSpectrum, cycleQuality, segmentDebugStats);
+                    settings, centerHz, averagedFFT, cycleSpectrum, cycleMeanSpectrum,
+                    cycleQuality, segmentDebugStats, artifactDiagnostics);
                 segmentDebugStats.accumulatedUniqueWideBins = static_cast<std::size_t>(std::count_if(
                     cycleSpectrum.begin(), cycleSpectrum.end(), [](float value) { return isValidDbfs(value); }));
                 segmentDebugStats.wideBinsTotal = cycleSpectrum.size();
@@ -999,6 +1102,7 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(displayMutex);
                     currentSegmentDebugStats = segmentDebugStats;
+                    currentArtifactDiagnostics = std::move(artifactDiagnostics);
                     statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
                 }
             }
@@ -1054,6 +1158,263 @@ private:
             centers.push_back(lastCenter);
         }
         return centers;
+    }
+
+    std::vector<SegmentBoundaryDiagnostic> buildSegmentBoundaries(
+        const SweepSettings& settings, const std::vector<double>& centers) const {
+        std::vector<SegmentBoundaryDiagnostic> boundaries;
+        boundaries.reserve(centers.size());
+        const double usableHalf = settings.sampleRateHz * USABLE_BANDWIDTH_RATIO * 0.5;
+        for (std::size_t segmentIndex = 0; segmentIndex < centers.size(); ++segmentIndex) {
+            SegmentBoundaryDiagnostic boundary;
+            boundary.usableStartHz = std::max(settings.startHz, centers[segmentIndex] - usableHalf);
+            boundary.usableStopHz = std::min(settings.stopHz, centers[segmentIndex] + usableHalf);
+            if (!boundaries.empty()) {
+                boundary.overlapStartHz = std::max(
+                    boundaries.back().usableStartHz, boundary.usableStartHz);
+                boundary.overlapStopHz = std::min(
+                    boundaries.back().usableStopHz, boundary.usableStopHz);
+                boundary.hasOverlap = boundary.overlapStopHz > boundary.overlapStartHz;
+            }
+            boundaries.push_back(boundary);
+        }
+        return boundaries;
+    }
+
+    static FFTFrameComparison compareFFTFrames(const std::vector<float>& first,
+                                               const std::vector<float>& second) {
+        FFTFrameComparison comparison;
+        if (first.size() != second.size() || first.empty()) {
+            return comparison;
+        }
+
+        double absoluteDifferenceSum = 0.0;
+        std::size_t withinOneDb = 0;
+        std::size_t withinThreeDb = 0;
+        for (std::size_t bin = 0; bin < first.size(); ++bin) {
+            if (!isValidDbfs(first[bin]) || !isValidDbfs(second[bin])) {
+                continue;
+            }
+            const double difference = std::abs(
+                static_cast<double>(first[bin]) - static_cast<double>(second[bin]));
+            absoluteDifferenceSum += difference;
+            withinOneDb += difference <= 1.0;
+            withinThreeDb += difference <= 3.0;
+            ++comparison.comparedBins;
+        }
+        if (comparison.comparedBins == 0) {
+            return comparison;
+        }
+
+        comparison.available = true;
+        comparison.meanAbsoluteDifferenceDb =
+            absoluteDifferenceSum / static_cast<double>(comparison.comparedBins);
+        comparison.withinOneDbPercent =
+            100.0 * static_cast<double>(withinOneDb) /
+            static_cast<double>(comparison.comparedBins);
+        comparison.withinThreeDbPercent =
+            100.0 * static_cast<double>(withinThreeDb) /
+            static_cast<double>(comparison.comparedBins);
+        return comparison;
+    }
+
+    void computeSpectrumArtifactDiagnostics(
+        const std::vector<float>& fft,
+        const std::vector<std::vector<float>>& consistencyFrames,
+        double sampleRateHz, double centerHz, int segmentNumber,
+        SpectrumArtifactDiagnostics& diagnostics) const {
+        diagnostics = {};
+        diagnostics.segmentNumber = segmentNumber;
+        diagnostics.centerHz = centerHz;
+        diagnostics.sampleRateHz = sampleRateHz;
+        diagnostics.rawBinCount = fft.size();
+        if (fft.size() < 3 || !std::isfinite(sampleRateHz) || sampleRateHz <= 0.0) {
+            return;
+        }
+
+        const double rawBinWidthHz = sampleRateHz / static_cast<double>(fft.size());
+        std::vector<float> validValues;
+        validValues.reserve(fft.size());
+        double sum = 0.0;
+        for (float value : fft) {
+            if (!isValidDbfs(value)) {
+                continue;
+            }
+            validValues.push_back(value);
+            sum += value;
+            includeInRange(value, diagnostics.rawMinimumDbfs, diagnostics.rawMaximumDbfs);
+        }
+        diagnostics.validRawBinCount = validValues.size();
+        if (validValues.empty()) {
+            return;
+        }
+
+        diagnostics.rawMeanDbfs = sum / static_cast<double>(validValues.size());
+        double squaredDifferenceSum = 0.0;
+        for (float value : validValues) {
+            const double difference = static_cast<double>(value) - diagnostics.rawMeanDbfs;
+            squaredDifferenceSum += difference * difference;
+        }
+        diagnostics.rawStandardDeviationDb = std::sqrt(
+            squaredDifferenceSum / static_cast<double>(validValues.size()));
+
+        std::sort(validValues.begin(), validValues.end());
+        const std::size_t middle = validValues.size() / 2;
+        diagnostics.rawMedianDbfs = (validValues.size() % 2) != 0
+                                        ? validValues[middle]
+                                        : (static_cast<double>(validValues[middle - 1]) +
+                                           static_cast<double>(validValues[middle])) *
+                                              0.5;
+        const std::size_t noiseFloorIndex = static_cast<std::size_t>(
+            std::floor(0.20 * static_cast<double>(validValues.size() - 1)));
+        diagnostics.estimatedNoiseFloorDbfs = validValues[noiseFloorIndex];
+
+        std::vector<std::size_t> sixDbPeakBins;
+        for (std::size_t bin = 1; bin + 1 < fft.size(); ++bin) {
+            if (!isValidDbfs(fft[bin - 1]) || !isValidDbfs(fft[bin]) ||
+                !isValidDbfs(fft[bin + 1])) {
+                continue;
+            }
+            if (!(fft[bin] > fft[bin - 1] && fft[bin] > fft[bin + 1])) {
+                continue;
+            }
+            if (fft[bin] > diagnostics.estimatedNoiseFloorDbfs + 6.0) {
+                ++diagnostics.localPeaksAboveSixDb;
+                sixDbPeakBins.push_back(bin);
+            }
+            if (fft[bin] > diagnostics.estimatedNoiseFloorDbfs + 10.0) {
+                ++diagnostics.localPeaksAboveTenDb;
+            }
+        }
+
+        if (sixDbPeakBins.size() > 1) {
+            std::vector<std::size_t> spacings;
+            spacings.reserve(sixDbPeakBins.size() - 1);
+            double spacingSum = 0.0;
+            for (std::size_t peak = 1; peak < sixDbPeakBins.size(); ++peak) {
+                const std::size_t spacing = sixDbPeakBins[peak] - sixDbPeakBins[peak - 1];
+                spacings.push_back(spacing);
+                spacingSum += static_cast<double>(spacing);
+            }
+            diagnostics.averagePeakSpacingBins =
+                spacingSum / static_cast<double>(spacings.size());
+
+            std::sort(spacings.begin(), spacings.end());
+            std::size_t bestSpacing = spacings.front();
+            std::size_t bestCount = 0;
+            for (std::size_t begin = 0; begin < spacings.size();) {
+                std::size_t end = begin + 1;
+                while (end < spacings.size() && spacings[end] == spacings[begin]) {
+                    ++end;
+                }
+                const std::size_t count = end - begin;
+                if (count > bestCount) {
+                    bestCount = count;
+                    bestSpacing = spacings[begin];
+                }
+                begin = end;
+            }
+            diagnostics.dominantPeakSpacingBins = bestSpacing;
+            diagnostics.dominantPeakSpacingHz =
+                static_cast<double>(bestSpacing) * rawBinWidthHz;
+        }
+
+        const std::size_t fixedIndices[V12_FIXED_SAMPLE_COUNT] = {
+            0, 1, 64, 128, 256, 512, 1024, 2048,
+            4096, 8192, 16384, 32768, 49152, 65534, 65535
+        };
+        for (std::size_t sample = 0; sample < V12_FIXED_SAMPLE_COUNT; ++sample) {
+            if (fixedIndices[sample] >= fft.size()) {
+                continue;
+            }
+            RawFFTFixedSample& fixedSample =
+                diagnostics.fixedSamples[diagnostics.fixedSamplesWritten++];
+            fixedSample.bin = fixedIndices[sample];
+            fixedSample.offsetHz =
+                -sampleRateHz * 0.5 +
+                ((static_cast<double>(fixedIndices[sample]) + 0.5) * rawBinWidthHz);
+            fixedSample.valueDbfs = fft[fixedIndices[sample]];
+        }
+
+        const std::size_t candidatePeriods[V12_PERIODICITY_COUNT] = {
+            8, 16, 32, 64, 128, 256, 512, 1024
+        };
+        for (std::size_t candidate = 0; candidate < V12_PERIODICITY_COUNT; ++candidate) {
+            FFTPeriodicityDiagnostic& periodicity = diagnostics.periodicity[candidate];
+            periodicity.periodBins = candidatePeriods[candidate];
+            periodicity.periodHz =
+                static_cast<double>(periodicity.periodBins) * rawBinWidthHz;
+            double sumX = 0.0;
+            double sumY = 0.0;
+            double sumXX = 0.0;
+            double sumYY = 0.0;
+            double sumXY = 0.0;
+            double absoluteDifferenceSum = 0.0;
+            for (std::size_t bin = 0; bin + periodicity.periodBins < fft.size(); ++bin) {
+                const float first = fft[bin];
+                const float second = fft[bin + periodicity.periodBins];
+                if (!isValidDbfs(first) || !isValidDbfs(second)) {
+                    continue;
+                }
+                const double x = first;
+                const double y = second;
+                sumX += x;
+                sumY += y;
+                sumXX += x * x;
+                sumYY += y * y;
+                sumXY += x * y;
+                absoluteDifferenceSum += std::abs(x - y);
+                ++periodicity.comparedPairs;
+            }
+            if (periodicity.comparedPairs == 0) {
+                continue;
+            }
+            periodicity.meanAbsoluteDifferenceDb =
+                absoluteDifferenceSum / static_cast<double>(periodicity.comparedPairs);
+            const double pairCount = static_cast<double>(periodicity.comparedPairs);
+            const double covariance = (pairCount * sumXY) - (sumX * sumY);
+            const double varianceX = (pairCount * sumXX) - (sumX * sumX);
+            const double varianceY = (pairCount * sumYY) - (sumY * sumY);
+            const double denominator = std::sqrt(std::max(0.0, varianceX * varianceY));
+            if (denominator <= 0.0) {
+                continue;
+            }
+            periodicity.score = covariance / denominator;
+            if (!std::isfinite(diagnostics.strongestPeriodScore) ||
+                periodicity.score > diagnostics.strongestPeriodScore) {
+                diagnostics.strongestPeriodBins = periodicity.periodBins;
+                diagnostics.strongestPeriodHz = periodicity.periodHz;
+                diagnostics.strongestPeriodScore = periodicity.score;
+            }
+        }
+
+        diagnostics.consistencyFrameCount = consistencyFrames.size();
+        if (consistencyFrames.size() >= 2) {
+            diagnostics.frameOneToTwo = compareFFTFrames(
+                consistencyFrames[0], consistencyFrames[1]);
+        }
+        if (consistencyFrames.size() >= 3) {
+            diagnostics.frameTwoToThree = compareFFTFrames(
+                consistencyFrames[1], consistencyFrames[2]);
+        }
+
+        const std::size_t displayPointCount = std::min(
+            V12_RAW_GRAPH_POINT_COUNT, fft.size());
+        diagnostics.rawFFTDisplay.assign(displayPointCount, NO_DATA_DBFS);
+        for (std::size_t displayPoint = 0; displayPoint < displayPointCount; ++displayPoint) {
+            const std::size_t firstBin = (displayPoint * fft.size()) / displayPointCount;
+            const std::size_t lastBin = std::max(
+                firstBin + 1, ((displayPoint + 1) * fft.size()) / displayPointCount);
+            float maximum = NO_DATA_DBFS;
+            for (std::size_t bin = firstBin; bin < lastBin && bin < fft.size(); ++bin) {
+                if (isValidDbfs(fft[bin]) &&
+                    (!std::isfinite(maximum) || fft[bin] > maximum)) {
+                    maximum = fft[bin];
+                }
+            }
+            diagnostics.rawFFTDisplay[displayPoint] = maximum;
+        }
+        diagnostics.available = true;
     }
 
     bool captureIQFrame(std::size_t sampleCount, double sampleRateHz,
@@ -1162,10 +1523,11 @@ private:
         return true;
     }
 
-    bool captureAveragedFFT(int requestedFrames, double sampleRateHz,
+    bool captureAveragedFFT(int requestedFrames, double sampleRateHz, double centerHz,
                             std::vector<float>& averagedFFT,
                             SpectrumDebugStats& debugStats,
-                            SegmentDebugStats& segmentDebugStats) {
+                            SegmentDebugStats& segmentDebugStats,
+                            SpectrumArtifactDiagnostics& artifactDiagnostics) {
         const long long intervalSamples = std::llround(sampleRateHz / DIRECT_FFT_RATE);
         const std::size_t iqSamplesPerFrame = static_cast<std::size_t>(
             std::clamp<long long>(intervalSamples, 2, DIRECT_FFT_SIZE));
@@ -1176,6 +1538,9 @@ private:
         std::vector<unsigned char> sawZero(DIRECT_FFT_SIZE, 0);
         std::vector<unsigned char> sawNonFinite(DIRECT_FFT_SIZE, 0);
         std::vector<unsigned char> sawOutOfRange(DIRECT_FFT_SIZE, 0);
+        std::vector<std::vector<float>> consistencyFrames;
+        consistencyFrames.reserve(3);
+        std::vector<float> lastRawFFT;
 
         for (int capturedFrames = 0; capturedFrames < requestedFrames; ++capturedFrames) {
             std::vector<dsp::complex_t> iqSamples;
@@ -1188,6 +1553,10 @@ private:
             if (!computeDirectFFT(iqSamples, fftData) || fftData.size() != DIRECT_FFT_SIZE) {
                 return false;
             }
+            if (consistencyFrames.size() < 3) {
+                consistencyFrames.push_back(fftData);
+            }
+            lastRawFFT = fftData;
 
             if (segmentDebugStats.firstIQFrameGeneration == 0) {
                 segmentDebugStats.firstIQFrameGeneration = generation;
@@ -1248,12 +1617,19 @@ private:
             }
         }
         segmentDebugStats.rawFftBinCount = averagedFFT.size();
+        computeSpectrumArtifactDiagnostics(
+            lastRawFFT, consistencyFrames, sampleRateHz, centerHz,
+            segmentDebugStats.segmentNumber, artifactDiagnostics);
         return true;
     }
 
-    std::size_t mergeSegment(const SweepSettings& settings, double centerHz, const std::vector<float>& fft,
-                             std::vector<float>& output, std::vector<float>& quality,
-                             SegmentDebugStats& segmentDebugStats) const {
+    std::size_t mergeSegment(const SweepSettings& settings, double centerHz,
+                             const std::vector<float>& fft,
+                             std::vector<float>& output,
+                             std::vector<float>& diagnosticMeanOutput,
+                             std::vector<float>& quality,
+                             SegmentDebugStats& segmentDebugStats,
+                             SpectrumArtifactDiagnostics& artifactDiagnostics) const {
         if (fft.size() < 2 || output.empty() || output.size() != quality.size()) {
             return 0;
         }
@@ -1275,10 +1651,21 @@ private:
         segmentDebugStats.usableStartHz = effectiveUsableStartHz;
         segmentDebugStats.usableStopHz = effectiveUsableStopHz;
 
+        SegmentContributionDiagnostics contribution;
+        contribution.centerHz = centerHz;
+        contribution.rawStartHz = rawStartHz;
+        contribution.rawStopHz = rawStopHz;
+        contribution.usableStartHz = effectiveUsableStartHz;
+        contribution.usableStopHz = effectiveUsableStopHz;
+
         // Project every valid raw FFT bin exactly once. A wide bin is much wider
         // than a raw bin, so every raw bin landing in it participates in the max
         // reduction instead of relying on rounded, output-driven index ranges.
         std::vector<float> segmentSpectrum(output.size(), NO_DATA_DBFS);
+        std::vector<double> segmentSums(output.size(), 0.0);
+        std::vector<std::size_t> segmentCounts(output.size(), 0);
+        std::vector<float> segmentHighest(output.size(), NO_DATA_DBFS);
+        std::vector<float> segmentSecondHighest(output.size(), NO_DATA_DBFS);
         for (std::size_t rawIndex = 0; rawIndex < fft.size(); ++rawIndex) {
             const float candidate = fft[rawIndex];
             if (!isValidDbfs(candidate)) {
@@ -1296,10 +1683,49 @@ private:
                 continue;
             }
             const std::size_t wideIndex = static_cast<std::size_t>(std::floor(widePosition));
+            ++contribution.rawBinsUsed;
+            segmentSums[wideIndex] += candidate;
+            ++segmentCounts[wideIndex];
+            if (!std::isfinite(segmentHighest[wideIndex]) ||
+                candidate > segmentHighest[wideIndex]) {
+                segmentSecondHighest[wideIndex] = segmentHighest[wideIndex];
+                segmentHighest[wideIndex] = candidate;
+            }
+            else if (!std::isfinite(segmentSecondHighest[wideIndex]) ||
+                     candidate > segmentSecondHighest[wideIndex]) {
+                segmentSecondHighest[wideIndex] = candidate;
+            }
             float& segmentLevel = segmentSpectrum[wideIndex];
             if (!std::isfinite(segmentLevel) || candidate > segmentLevel) {
                 segmentLevel = candidate;
             }
+        }
+
+        std::vector<std::size_t> hitWideBins;
+        hitWideBins.reserve(output.size());
+        std::size_t rawBinsAcrossHitWideBins = 0;
+        contribution.minimumRawBinsPerWideBin = std::numeric_limits<std::size_t>::max();
+        for (std::size_t wideIndex = 0; wideIndex < output.size(); ++wideIndex) {
+            const std::size_t contributingBins = segmentCounts[wideIndex];
+            if (contributingBins == 0) {
+                continue;
+            }
+            hitWideBins.push_back(wideIndex);
+            rawBinsAcrossHitWideBins += contributingBins;
+            ++contribution.wideBinsHit;
+            contribution.wideBinsWithMultipleRawBins += contributingBins > 1;
+            contribution.minimumRawBinsPerWideBin = std::min(
+                contribution.minimumRawBinsPerWideBin, contributingBins);
+            contribution.maximumRawBinsPerWideBin = std::max(
+                contribution.maximumRawBinsPerWideBin, contributingBins);
+        }
+        if (contribution.wideBinsHit > 0) {
+            contribution.averageRawBinsPerWideBin =
+                static_cast<double>(rawBinsAcrossHitWideBins) /
+                static_cast<double>(contribution.wideBinsHit);
+        }
+        else {
+            contribution.minimumRawBinsPerWideBin = 0;
         }
 
         std::size_t writtenBins = 0;
@@ -1318,8 +1744,66 @@ private:
             }
 
             output[wideIndex] = level;
+            if (diagnosticMeanOutput.size() == output.size() &&
+                segmentCounts[wideIndex] > 0) {
+                diagnosticMeanOutput[wideIndex] = static_cast<float>(
+                    segmentSums[wideIndex] /
+                    static_cast<double>(segmentCounts[wideIndex]));
+            }
             quality[wideIndex] = segmentQuality;
             ++writtenBins;
+        }
+
+        const std::size_t requestedSamples = std::min(
+            V12_WIDE_SAMPLE_COUNT, hitWideBins.size());
+        for (std::size_t sample = 0; sample < requestedSamples; ++sample) {
+            const std::size_t hitPosition = requestedSamples == 1
+                                                ? 0
+                                                : (sample * (hitWideBins.size() - 1)) /
+                                                      (requestedSamples - 1);
+            const std::size_t wideIndex = hitWideBins[hitPosition];
+            WideBinContributionSample& contributionSample =
+                contribution.samples[contribution.samplesWritten++];
+            contributionSample.wideBinIndex = wideIndex;
+            contributionSample.frequencyHz = settings.startHz +
+                                             ((static_cast<double>(wideIndex) + 0.5) *
+                                              wideBinWidthHz);
+            contributionSample.contributingRawBins = segmentCounts[wideIndex];
+            contributionSample.selectedMaximumDbfs = segmentSpectrum[wideIndex];
+            contributionSample.highestRawDbfs = segmentHighest[wideIndex];
+            contributionSample.secondHighestRawDbfs = segmentSecondHighest[wideIndex];
+        }
+
+        artifactDiagnostics.contribution = contribution;
+        artifactDiagnostics.mergedWideMaximum = output;
+        artifactDiagnostics.mergedWideMean = diagnosticMeanOutput;
+        double maxMinusMeanSum = 0.0;
+        std::size_t aboveThreeDb = 0;
+        std::size_t aboveSixDb = 0;
+        for (std::size_t wideIndex = 0;
+             wideIndex < output.size() && wideIndex < diagnosticMeanOutput.size();
+             ++wideIndex) {
+            if (!isValidDbfs(output[wideIndex]) ||
+                !isValidDbfs(diagnosticMeanOutput[wideIndex])) {
+                continue;
+            }
+            const double difference = static_cast<double>(output[wideIndex]) -
+                                      static_cast<double>(diagnosticMeanOutput[wideIndex]);
+            maxMinusMeanSum += difference;
+            aboveThreeDb += difference > 3.0;
+            aboveSixDb += difference > 6.0;
+            ++artifactDiagnostics.maxMeanComparableBins;
+        }
+        if (artifactDiagnostics.maxMeanComparableBins > 0) {
+            artifactDiagnostics.averageMaxMinusMeanDb =
+                maxMinusMeanSum /
+                static_cast<double>(artifactDiagnostics.maxMeanComparableBins);
+            artifactDiagnostics.maxMinusMeanAboveThreeDbPercent =
+                100.0 * static_cast<double>(aboveThreeDb) /
+                static_cast<double>(artifactDiagnostics.maxMeanComparableBins);
+            artifactDiagnostics.maxMinusMeanAboveSixDbPercent =
+                100.0 * static_cast<double>(aboveSixDb) /
+                static_cast<double>(artifactDiagnostics.maxMeanComparableBins);
         }
         return writtenBins;
     }
@@ -1476,12 +1960,14 @@ private:
     void drawSpectrumGraph() {
         std::vector<float> spectrum;
         std::vector<float> heldPeaks;
+        std::vector<SegmentBoundaryDiagnostic> segmentBoundaries;
         double startHz = startFrequencyMHz * 1e6;
         double stopHz = stopFrequencyMHz * 1e6;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             spectrum = completedSweep;
             heldPeaks = peakSpectrum;
+            segmentBoundaries = activeSegmentBoundaries;
             if (displayedStopHz > displayedStartHz) {
                 startHz = displayedStartHz;
                 stopHz = displayedStopHz;
@@ -1529,6 +2015,46 @@ private:
             const ImVec2 textSize = ImGui::CalcTextSize(label);
             drawList->AddText(ImVec2(std::clamp(x - (textSize.x * 0.5f), plotMin.x, plotMax.x - textSize.x), plotMax.y + (4.0f * scale)),
                               IM_COL32(180, 185, 195, 255), label);
+        }
+
+        auto frequencyToX = [&](double frequencyHz) {
+            const double ratio = (frequencyHz - startHz) / (stopHz - startHz);
+            return plotMin.x +
+                   (static_cast<float>(std::clamp(ratio, 0.0, 1.0)) *
+                    (plotMax.x - plotMin.x));
+        };
+        auto drawDashedVertical = [&](float x, ImU32 color) {
+            const float dashLength = 4.0f * scale;
+            const float gapLength = 3.0f * scale;
+            for (float y = plotMin.y; y < plotMax.y; y += dashLength + gapLength) {
+                drawList->AddLine(
+                    ImVec2(x, y), ImVec2(x, std::min(plotMax.y, y + dashLength)),
+                    color, 1.0f * scale);
+            }
+        };
+        for (const SegmentBoundaryDiagnostic& boundary : segmentBoundaries) {
+            if (boundary.usableStopHz <= startHz || boundary.usableStartHz >= stopHz) {
+                continue;
+            }
+            drawList->AddLine(
+                ImVec2(frequencyToX(boundary.usableStartHz), plotMin.y),
+                ImVec2(frequencyToX(boundary.usableStartHz), plotMax.y),
+                IM_COL32(175, 105, 255, 130), 1.0f * scale);
+            drawList->AddLine(
+                ImVec2(frequencyToX(boundary.usableStopHz), plotMin.y),
+                ImVec2(frequencyToX(boundary.usableStopHz), plotMax.y),
+                IM_COL32(175, 105, 255, 130), 1.0f * scale);
+            if (boundary.hasOverlap) {
+                drawDashedVertical(frequencyToX(boundary.overlapStartHz),
+                                   IM_COL32(255, 135, 55, 210));
+                drawDashedVertical(frequencyToX(boundary.overlapStopHz),
+                                   IM_COL32(255, 135, 55, 210));
+            }
+        }
+        if (!segmentBoundaries.empty()) {
+            drawList->AddText(
+                ImVec2(plotMin.x + (4.0f * scale), plotMax.y - (16.0f * scale)),
+                IM_COL32(205, 185, 225, 220), "solid: usable | dashed: overlap");
         }
 
         const float thresholdY = levelToY(thresholdDbfs);
@@ -1676,6 +2202,284 @@ private:
         ImGui::TreePop();
     }
 
+    void drawV12SpectrumGraph(const char* title, const char* id,
+                              const std::vector<float>& primary,
+                              const std::vector<float>* secondary = nullptr) {
+        ImGui::TextUnformatted(title);
+        const float scale = style::uiScale;
+        const ImVec2 canvasPosition = ImGui::GetCursorScreenPos();
+        const ImVec2 canvasSize(
+            std::max(120.0f, ImGui::GetContentRegionAvail().x), 130.0f * scale);
+        ImGui::InvisibleButton(
+            ("##wsm_v12_" + std::string(id) + "_" + name).c_str(), canvasSize);
+
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        const ImVec2 canvasEnd(
+            canvasPosition.x + canvasSize.x, canvasPosition.y + canvasSize.y);
+        drawList->AddRectFilled(canvasPosition, canvasEnd, IM_COL32(12, 16, 22, 255));
+        drawList->AddRect(canvasPosition, canvasEnd, IM_COL32(90, 100, 115, 255));
+        const ImVec2 plotMin(
+            canvasPosition.x + (42.0f * scale), canvasPosition.y + (7.0f * scale));
+        const ImVec2 plotMax(
+            canvasEnd.x - (7.0f * scale), canvasEnd.y - (7.0f * scale));
+        if (plotMax.x <= plotMin.x || plotMax.y <= plotMin.y) {
+            return;
+        }
+
+        auto levelToY = [&](float level) {
+            const float clamped = std::clamp(level, GRAPH_MIN_DB, GRAPH_MAX_DB);
+            const float ratio =
+                (clamped - GRAPH_MIN_DB) / (GRAPH_MAX_DB - GRAPH_MIN_DB);
+            return plotMax.y - (ratio * (plotMax.y - plotMin.y));
+        };
+        char label[32];
+        for (int tick = 0; tick <= 4; ++tick) {
+            const float level = GRAPH_MIN_DB +
+                                ((GRAPH_MAX_DB - GRAPH_MIN_DB) * tick / 4.0f);
+            const float y = levelToY(level);
+            drawList->AddLine(
+                ImVec2(plotMin.x, y), ImVec2(plotMax.x, y),
+                IM_COL32(48, 55, 65, 255));
+            std::snprintf(label, sizeof(label), "%.0f", level);
+            drawList->AddText(
+                ImVec2(canvasPosition.x + (2.0f * scale), y - (7.0f * scale)),
+                IM_COL32(175, 180, 190, 255), label);
+        }
+
+        auto drawTrace = [&](const std::vector<float>& data, ImU32 color,
+                             float thickness) {
+            if (data.size() < 2) {
+                return;
+            }
+            bool havePrevious = false;
+            ImVec2 previous;
+            for (std::size_t index = 0; index < data.size(); ++index) {
+                if (!isValidDbfs(data[index])) {
+                    havePrevious = false;
+                    continue;
+                }
+                const float xRatio = static_cast<float>(index) /
+                                     static_cast<float>(data.size() - 1);
+                const ImVec2 point(
+                    plotMin.x + (xRatio * (plotMax.x - plotMin.x)),
+                    levelToY(data[index]));
+                if (havePrevious) {
+                    drawList->AddLine(previous, point, color, thickness * scale);
+                }
+                previous = point;
+                havePrevious = true;
+            }
+        };
+
+        drawTrace(primary, IM_COL32(50, 225, 155, 255), 1.2f);
+        if (secondary) {
+            drawTrace(*secondary, IM_COL32(80, 155, 255, 235), 1.0f);
+            drawList->AddText(
+                ImVec2(plotMin.x + (4.0f * scale), plotMin.y + (2.0f * scale)),
+                IM_COL32(205, 215, 225, 255), "green: wideMax | blue: wideMean");
+        }
+        if (primary.empty()) {
+            drawList->AddText(
+                ImVec2(plotMin.x + (8.0f * scale), plotMin.y + (8.0f * scale)),
+                IM_COL32(190, 195, 205, 255), "Waiting for diagnostic spectrum");
+        }
+    }
+
+    static void drawFrameComparison(const char* label,
+                                    const FFTFrameComparison& comparison) {
+        if (!comparison.available) {
+            ImGui::Text("%s: unavailable", label);
+            return;
+        }
+        ImGui::Text(
+            "%s: mean |dB| %.3f, <=1 dB %.1f%%, <=3 dB %.1f%% (%zu bins)",
+            label, comparison.meanAbsoluteDifferenceDb,
+            comparison.withinOneDbPercent, comparison.withinThreeDbPercent,
+            comparison.comparedBins);
+    }
+
+    void drawSpectrumArtifactDiagnostics(
+        const SpectrumArtifactDiagnostics& diagnostics) {
+        if (!ImGui::CollapsingHeader("V12 Spectrum artefact diagnostic",
+                                     ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+        if (!diagnostics.available) {
+            ImGui::TextDisabled("Waiting for the first valid direct FFT frame.");
+            return;
+        }
+
+        ImGui::Text("Current diagnostic segment: %d | center %.6f MHz",
+                    diagnostics.segmentNumber, diagnostics.centerHz / 1e6);
+        ImGui::Text("Raw valid bins: %zu / %zu", diagnostics.validRawBinCount,
+                    diagnostics.rawBinCount);
+        ImGui::Text("Raw min / max: %.3f / %.3f dBFS",
+                    diagnostics.rawMinimumDbfs, diagnostics.rawMaximumDbfs);
+        ImGui::Text("Raw mean / median: %.3f / %.3f dBFS",
+                    diagnostics.rawMeanDbfs, diagnostics.rawMedianDbfs);
+        ImGui::Text("Raw standard deviation: %.3f dB",
+                    diagnostics.rawStandardDeviationDb);
+        ImGui::Text("Estimated noise floor (20th percentile): %.3f dBFS",
+                    diagnostics.estimatedNoiseFloorDbfs);
+        ImGui::Text("Local peaks above floor +6 / +10 dB: %zu / %zu",
+                    diagnostics.localPeaksAboveSixDb,
+                    diagnostics.localPeaksAboveTenDb);
+        if (std::isfinite(diagnostics.averagePeakSpacingBins)) {
+            const double rawBinWidthHz = diagnostics.rawBinCount > 0
+                                             ? diagnostics.sampleRateHz /
+                                                   static_cast<double>(diagnostics.rawBinCount)
+                                             : 0.0;
+            ImGui::Text("Average peak spacing: %.3f bins / %.3f Hz",
+                        diagnostics.averagePeakSpacingBins,
+                        diagnostics.averagePeakSpacingBins * rawBinWidthHz);
+            ImGui::Text("Dominant peak spacing: %zu bins / %.3f Hz",
+                        diagnostics.dominantPeakSpacingBins,
+                        diagnostics.dominantPeakSpacingHz);
+        }
+        else {
+            ImGui::TextUnformatted("Peak spacing: insufficient +6 dB local peaks");
+        }
+        if (diagnostics.strongestPeriodBins > 0 &&
+            std::isfinite(diagnostics.strongestPeriodScore)) {
+            ImGui::Text("Strongest periodicity: %zu bins / %.3f Hz | score %.6f",
+                        diagnostics.strongestPeriodBins,
+                        diagnostics.strongestPeriodHz,
+                        diagnostics.strongestPeriodScore);
+        }
+        else {
+            ImGui::TextUnformatted("Strongest periodicity: unavailable");
+        }
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Raw-vs-merged indicator (descriptive only)");
+        if (diagnostics.maxMeanComparableBins > 0) {
+            ImGui::Text("wideMax - wideMean average: %.3f dB (%zu bins)",
+                        diagnostics.averageMaxMinusMeanDb,
+                        diagnostics.maxMeanComparableBins);
+            ImGui::Text("Difference >3 / >6 dB: %.1f%% / %.1f%%",
+                        diagnostics.maxMinusMeanAboveThreeDbPercent,
+                        diagnostics.maxMinusMeanAboveSixDbPercent);
+        }
+        else {
+            ImGui::TextUnformatted("wideMax vs wideMean: unavailable");
+        }
+        ImGui::TextDisabled(
+            "No automatic conclusion: compare raw and merged traces manually.");
+
+        const SegmentContributionDiagnostics& contribution = diagnostics.contribution;
+        ImGui::Separator();
+        ImGui::TextUnformatted("Current segment contribution");
+        ImGui::Text("Center: %.6f MHz", contribution.centerHz / 1e6);
+        ImGui::Text("Raw start / stop: %.6f / %.6f MHz",
+                    contribution.rawStartHz / 1e6, contribution.rawStopHz / 1e6);
+        ImGui::Text("Usable start / stop: %.6f / %.6f MHz",
+                    contribution.usableStartHz / 1e6,
+                    contribution.usableStopHz / 1e6);
+        ImGui::Text("Raw bins used: %zu", contribution.rawBinsUsed);
+        ImGui::Text("Wide bins hit / multiple contributors: %zu / %zu",
+                    contribution.wideBinsHit,
+                    contribution.wideBinsWithMultipleRawBins);
+        ImGui::Text("Raw bins per wide bin min / max / mean: %zu / %zu / %.3f",
+                    contribution.minimumRawBinsPerWideBin,
+                    contribution.maximumRawBinsPerWideBin,
+                    contribution.averageRawBinsPerWideBin);
+
+        ImGui::Separator();
+        ImGui::Text("Frame consistency: %zu consecutive captured frame(s)",
+                    diagnostics.consistencyFrameCount);
+        drawFrameComparison("Frame 1 -> 2", diagnostics.frameOneToTwo);
+        drawFrameComparison("Frame 2 -> 3", diagnostics.frameTwoToThree);
+
+        ImGui::Separator();
+        drawV12SpectrumGraph(
+            "Raw FFT - current segment (2048-point max envelope, display only)",
+            "raw_fft", diagnostics.rawFFTDisplay);
+        drawV12SpectrumGraph(
+            "Merged wide spectrum - wideMax vs wideMean (diagnostic)",
+            "max_mean", diagnostics.mergedWideMaximum,
+            &diagnostics.mergedWideMean);
+
+        if (ImGui::TreeNode("Periodicity candidates (Pearson score)")) {
+            const ImGuiTableFlags tableFlags =
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_SizingStretchProp;
+            if (ImGui::BeginTable("##wsm_v12_periodicity", 4, tableFlags)) {
+                ImGui::TableSetupColumn("Bins");
+                ImGui::TableSetupColumn("Hz");
+                ImGui::TableSetupColumn("Score");
+                ImGui::TableSetupColumn("Mean |dB|");
+                ImGui::TableHeadersRow();
+                for (const FFTPeriodicityDiagnostic& periodicity :
+                     diagnostics.periodicity) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%zu", periodicity.periodBins);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%.1f", periodicity.periodHz);
+                    ImGui::TableSetColumnIndex(2);
+                    if (std::isfinite(periodicity.score)) {
+                        ImGui::Text("%.6f", periodicity.score);
+                    }
+                    else {
+                        ImGui::TextUnformatted("n/a");
+                    }
+                    ImGui::TableSetColumnIndex(3);
+                    if (std::isfinite(periodicity.meanAbsoluteDifferenceDb)) {
+                        ImGui::Text("%.3f", periodicity.meanAbsoluteDifferenceDb);
+                    }
+                    else {
+                        ImGui::TextUnformatted("n/a");
+                    }
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Fixed raw FFT samples")) {
+            const ImGuiTableFlags tableFlags =
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_SizingStretchProp;
+            if (ImGui::BeginTable("##wsm_v12_fixed_samples", 3, tableFlags)) {
+                ImGui::TableSetupColumn("Bin");
+                ImGui::TableSetupColumn("Offset kHz");
+                ImGui::TableSetupColumn("dBFS");
+                ImGui::TableHeadersRow();
+                for (std::size_t sample = 0;
+                     sample < diagnostics.fixedSamplesWritten; ++sample) {
+                    const RawFFTFixedSample& fixedSample =
+                        diagnostics.fixedSamples[sample];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%zu", fixedSample.bin);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%.3f", fixedSample.offsetHz / 1e3);
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.6f", fixedSample.valueDbfs);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Sampled wide-bin contributions")) {
+            for (std::size_t sample = 0;
+                 sample < contribution.samplesWritten; ++sample) {
+                const WideBinContributionSample& contributionSample =
+                    contribution.samples[sample];
+                ImGui::TextWrapped(
+                    "[%zu] %.6f MHz: n=%zu, max=%.3f, top=%.3f, second=%.3f dBFS",
+                    contributionSample.wideBinIndex,
+                    contributionSample.frequencyHz / 1e6,
+                    contributionSample.contributingRawBins,
+                    contributionSample.selectedMaximumDbfs,
+                    contributionSample.highestRawDbfs,
+                    contributionSample.secondHighestRawDbfs);
+            }
+            ImGui::TreePop();
+        }
+    }
+
     void drawDebugInfo() {
         if (!ImGui::CollapsingHeader(("Debug##wsm_debug_" + name).c_str())) {
             return;
@@ -1692,6 +2496,7 @@ private:
         double segmentStepHz = 0.0;
         SpectrumDebugStats debugStats;
         SegmentDebugStats segmentDebugStats;
+        SpectrumArtifactDiagnostics artifactDiagnostics;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             segment = currentSegment;
@@ -1705,6 +2510,7 @@ private:
             segmentStepHz = activeSegmentStepHz;
             debugStats = lastDebugStats;
             segmentDebugStats = currentSegmentDebugStats;
+            artifactDiagnostics = currentArtifactDiagnostics;
         }
         const IQCaptureDiagnostics iqDiagnostics = snapshotIQCaptureDiagnostics();
         SplitterDiagnosticCheckpoint beforePrivateBind;
@@ -1773,6 +2579,8 @@ private:
                                          iqDiagnostics.privateStreamAddress);
         drawSplitterDiagnosticCheckpoint("At capture timeout", captureTimeout,
                                          fftInputAddress, iqDiagnostics.privateStreamAddress);
+        ImGui::Separator();
+        drawSpectrumArtifactDiagnostics(artifactDiagnostics);
         ImGui::Separator();
         ImGui::TextUnformatted("FFT source: private IQFrontEnd stream (V10 lifecycle)");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
@@ -1979,6 +2787,8 @@ private:
     double sweepsPerMinute = 0.0;
     SpectrumDebugStats lastDebugStats;
     SegmentDebugStats currentSegmentDebugStats;
+    SpectrumArtifactDiagnostics currentArtifactDiagnostics;
+    std::vector<SegmentBoundaryDiagnostic> activeSegmentBoundaries;
 
     double returnFrequencyHz = 0.0;
     double pendingTuneHz = 0.0;
