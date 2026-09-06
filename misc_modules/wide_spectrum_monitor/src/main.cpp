@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -50,6 +52,8 @@ namespace {
     constexpr std::size_t V12_FIXED_SAMPLE_COUNT = 15;
     constexpr std::size_t V12_PERIODICITY_COUNT = 8;
     constexpr std::size_t V12_WIDE_SAMPLE_COUNT = 16;
+    constexpr std::size_t V13_REDUCER_COUNT = 6;
+    constexpr std::size_t V13_TOP_PEAK_COUNT = 10;
     constexpr double USABLE_BANDWIDTH_RATIO = 0.85;
     constexpr float GRAPH_MIN_DB = -120.0f;
     constexpr float GRAPH_MAX_DB = 0.0f;
@@ -241,6 +245,95 @@ namespace {
         WideBinContributionSample samples[V12_WIDE_SAMPLE_COUNT];
     };
 
+    enum V13ReducerIndex : std::size_t {
+        V13_REDUCER_MAX = 0,
+        V13_REDUCER_MEAN,
+        V13_REDUCER_P95,
+        V13_REDUCER_P98,
+        V13_REDUCER_TOP4,
+        V13_REDUCER_TOP8
+    };
+
+    struct WideBinReducerContributor {
+        std::size_t contributingRawBins = 0;
+        float highestRawDbfs = NO_DATA_DBFS;
+        float secondHighestRawDbfs = NO_DATA_DBFS;
+        float fourthHighestRawDbfs = NO_DATA_DBFS;
+        float eighthHighestRawDbfs = NO_DATA_DBFS;
+        float percentile95Dbfs = NO_DATA_DBFS;
+        float percentile98Dbfs = NO_DATA_DBFS;
+        float meanDbfs = NO_DATA_DBFS;
+        float top4MeanDbfs = NO_DATA_DBFS;
+        float top8MeanDbfs = NO_DATA_DBFS;
+    };
+
+    struct RobustReducerSweepState {
+        std::vector<float> mean;
+        std::vector<float> percentile95;
+        std::vector<float> percentile98;
+        std::vector<float> top4Mean;
+        std::vector<float> top8Mean;
+        std::vector<WideBinReducerContributor> contributors;
+    };
+
+    struct ReducerDifferenceStatistics {
+        bool available = false;
+        std::size_t comparedBins = 0;
+        double averageDifferenceDb = std::numeric_limits<double>::quiet_NaN();
+        double medianDifferenceDb = std::numeric_limits<double>::quiet_NaN();
+        double percentile90DifferenceDb = std::numeric_limits<double>::quiet_NaN();
+        double aboveThreeDbPercent = 0.0;
+        double aboveSixDbPercent = 0.0;
+        double aboveTenDbPercent = 0.0;
+    };
+
+    struct PeakPreservationStatistics {
+        bool available = false;
+        std::size_t measuredPeaks = 0;
+        double averageLossDb = std::numeric_limits<double>::quiet_NaN();
+        double medianLossDb = std::numeric_limits<double>::quiet_NaN();
+        double worstLossDb = std::numeric_limits<double>::quiet_NaN();
+        double averageLocalSnrDb = std::numeric_limits<double>::quiet_NaN();
+        double withinOneDbPercent = 0.0;
+        double withinThreeDbPercent = 0.0;
+        double withinSixDbPercent = 0.0;
+    };
+
+    struct ReducerDiagnosticScore {
+        bool available = false;
+        double artifactSuppressionScore = 0.0;
+        double peakPreservationScore = 0.0;
+        double combinedScore = 0.0;
+    };
+
+    struct RobustPeakDiagnostic {
+        std::size_t wideBinIndex = 0;
+        double frequencyHz = 0.0;
+        float maximumBaselineDbfs = NO_DATA_DBFS;
+        std::array<float, V13_REDUCER_COUNT> levelsDbfs;
+        std::array<double, V13_REDUCER_COUNT> lossesDb;
+        std::array<double, V13_REDUCER_COUNT> localSnrDb;
+        WideBinReducerContributor contributor;
+    };
+
+    struct RobustReducerDiagnostics {
+        bool available = false;
+        double startHz = 0.0;
+        double stopHz = 0.0;
+        std::size_t detectedMaximumPeaks = 0;
+        std::vector<float> maximum;
+        std::vector<float> mean;
+        std::vector<float> percentile95;
+        std::vector<float> percentile98;
+        std::vector<float> top4Mean;
+        std::vector<float> top8Mean;
+        std::vector<WideBinReducerContributor> contributors;
+        ReducerDifferenceStatistics difference[V13_REDUCER_COUNT];
+        PeakPreservationStatistics peakPreservation[V13_REDUCER_COUNT];
+        ReducerDiagnosticScore score[V13_REDUCER_COUNT];
+        std::vector<RobustPeakDiagnostic> strongestPeaks;
+    };
+
     struct SpectrumArtifactDiagnostics {
         bool available = false;
         int segmentNumber = 0;
@@ -276,6 +369,7 @@ namespace {
         std::vector<float> rawFFTDisplay;
         std::vector<float> mergedWideMaximum;
         std::vector<float> mergedWideMean;
+        RobustReducerDiagnostics robustReducers;
     };
 
     struct SegmentBoundaryDiagnostic {
@@ -1038,9 +1132,15 @@ private:
 
         while (sweepRequested.load() && !shuttingDown.load()) {
             // These buffers live for the entire sweep. Segments only merge into
-            // them; neither buffer is reset inside the segment loop.
+            // them; no reducer trace is reset inside the segment loop.
             std::vector<float> cycleSpectrum(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            std::vector<float> cycleMeanSpectrum(WIDE_BIN_COUNT, NO_DATA_DBFS);
+            RobustReducerSweepState cycleReducers;
+            cycleReducers.mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+            cycleReducers.percentile95.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+            cycleReducers.percentile98.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+            cycleReducers.top4Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+            cycleReducers.top8Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+            cycleReducers.contributors.resize(WIDE_BIN_COUNT);
             std::vector<float> cycleQuality(WIDE_BIN_COUNT, -1.0f);
             SpectrumDebugStats cycleDebugStats;
             bool capturedAnySegment = false;
@@ -1088,7 +1188,7 @@ private:
                 }
 
                 segmentDebugStats.wideBinsWritten = mergeSegment(
-                    settings, centerHz, averagedFFT, cycleSpectrum, cycleMeanSpectrum,
+                    settings, centerHz, averagedFFT, cycleSpectrum, cycleReducers,
                     cycleQuality, segmentDebugStats, artifactDiagnostics);
                 segmentDebugStats.accumulatedUniqueWideBins = static_cast<std::size_t>(std::count_if(
                     cycleSpectrum.begin(), cycleSpectrum.end(), [](float value) { return isValidDbfs(value); }));
@@ -1623,14 +1723,302 @@ private:
         return true;
     }
 
+    static const char* robustReducerName(std::size_t reducer) {
+        static const char* names[V13_REDUCER_COUNT] = {
+            "MAX", "MEAN", "P95", "P98", "TOP4_MEAN", "TOP8_MEAN"
+        };
+        return reducer < V13_REDUCER_COUNT ? names[reducer] : "unknown";
+    }
+
+    static const std::vector<float>* robustReducerTrace(
+        const RobustReducerDiagnostics& diagnostics, std::size_t reducer) {
+        switch (reducer) {
+        case V13_REDUCER_MAX:
+            return &diagnostics.maximum;
+        case V13_REDUCER_MEAN:
+            return &diagnostics.mean;
+        case V13_REDUCER_P95:
+            return &diagnostics.percentile95;
+        case V13_REDUCER_P98:
+            return &diagnostics.percentile98;
+        case V13_REDUCER_TOP4:
+            return &diagnostics.top4Mean;
+        case V13_REDUCER_TOP8:
+            return &diagnostics.top8Mean;
+        default:
+            return nullptr;
+        }
+    }
+
+    static double sortedMedian(const std::vector<double>& sortedValues) {
+        if (sortedValues.empty()) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const std::size_t middle = sortedValues.size() / 2;
+        return (sortedValues.size() % 2) != 0
+                   ? sortedValues[middle]
+                   : (sortedValues[middle - 1] + sortedValues[middle]) * 0.5;
+    }
+
+    static double sortedPercentile(const std::vector<double>& sortedValues,
+                                   double percentile) {
+        if (sortedValues.empty()) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const std::size_t index = std::min(
+            sortedValues.size() - 1,
+            static_cast<std::size_t>(std::ceil(
+                percentile * static_cast<double>(sortedValues.size()))) -
+                1);
+        return sortedValues[index];
+    }
+
+    static bool localMedianExcludingCenter(const std::vector<float>& trace,
+                                           std::size_t center,
+                                           float& median) {
+        constexpr std::size_t radius = 5;
+        if (trace.empty() || center >= trace.size()) {
+            return false;
+        }
+        const std::size_t first = center > radius ? center - radius : 0;
+        const std::size_t last = std::min(trace.size() - 1, center + radius);
+        std::array<float, radius * 2> neighbors;
+        std::size_t count = 0;
+        for (std::size_t index = first; index <= last; ++index) {
+            if (index != center && isValidDbfs(trace[index])) {
+                neighbors[count++] = trace[index];
+            }
+        }
+        if (count == 0) {
+            return false;
+        }
+        std::sort(neighbors.begin(), neighbors.begin() + count);
+        const std::size_t middle = count / 2;
+        median = (count % 2) != 0
+                     ? neighbors[middle]
+                     : (neighbors[middle - 1] + neighbors[middle]) * 0.5f;
+        return true;
+    }
+
+    static void computeRobustReducerDiagnostics(
+        const SweepSettings& settings, const std::vector<float>& maximum,
+        const RobustReducerSweepState& reducers,
+        RobustReducerDiagnostics& diagnostics) {
+        diagnostics = {};
+        if (maximum.empty() || reducers.mean.size() != maximum.size() ||
+            reducers.percentile95.size() != maximum.size() ||
+            reducers.percentile98.size() != maximum.size() ||
+            reducers.top4Mean.size() != maximum.size() ||
+            reducers.top8Mean.size() != maximum.size() ||
+            reducers.contributors.size() != maximum.size()) {
+            return;
+        }
+
+        diagnostics.startHz = settings.startHz;
+        diagnostics.stopHz = settings.stopHz;
+        diagnostics.maximum = maximum;
+        diagnostics.mean = reducers.mean;
+        diagnostics.percentile95 = reducers.percentile95;
+        diagnostics.percentile98 = reducers.percentile98;
+        diagnostics.top4Mean = reducers.top4Mean;
+        diagnostics.top8Mean = reducers.top8Mean;
+        diagnostics.contributors = reducers.contributors;
+
+        for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT; ++reducer) {
+            const std::vector<float>* trace = robustReducerTrace(diagnostics, reducer);
+            if (!trace) {
+                continue;
+            }
+            std::vector<double> differences;
+            differences.reserve(maximum.size());
+            double sum = 0.0;
+            std::size_t aboveThree = 0;
+            std::size_t aboveSix = 0;
+            std::size_t aboveTen = 0;
+            for (std::size_t index = 0; index < maximum.size(); ++index) {
+                if (!isValidDbfs(maximum[index]) || !isValidDbfs((*trace)[index])) {
+                    continue;
+                }
+                const double difference = static_cast<double>(maximum[index]) -
+                                          static_cast<double>((*trace)[index]);
+                differences.push_back(difference);
+                sum += difference;
+                aboveThree += difference > 3.0;
+                aboveSix += difference > 6.0;
+                aboveTen += difference > 10.0;
+            }
+            if (differences.empty()) {
+                continue;
+            }
+            std::sort(differences.begin(), differences.end());
+            ReducerDifferenceStatistics& statistics = diagnostics.difference[reducer];
+            statistics.available = true;
+            statistics.comparedBins = differences.size();
+            statistics.averageDifferenceDb = sum / static_cast<double>(differences.size());
+            statistics.medianDifferenceDb = sortedMedian(differences);
+            statistics.percentile90DifferenceDb = sortedPercentile(differences, 0.90);
+            statistics.aboveThreeDbPercent =
+                100.0 * static_cast<double>(aboveThree) /
+                static_cast<double>(differences.size());
+            statistics.aboveSixDbPercent =
+                100.0 * static_cast<double>(aboveSix) /
+                static_cast<double>(differences.size());
+            statistics.aboveTenDbPercent =
+                100.0 * static_cast<double>(aboveTen) /
+                static_cast<double>(differences.size());
+        }
+
+        struct PeakCandidate {
+            std::size_t index = 0;
+            float baseline = NO_DATA_DBFS;
+        };
+        std::vector<PeakCandidate> peakCandidates;
+        for (std::size_t index = 1; index + 1 < maximum.size(); ++index) {
+            if (!isValidDbfs(maximum[index - 1]) || !isValidDbfs(maximum[index]) ||
+                !isValidDbfs(maximum[index + 1]) ||
+                !(maximum[index] > maximum[index - 1] &&
+                  maximum[index] > maximum[index + 1])) {
+                continue;
+            }
+            float baseline = NO_DATA_DBFS;
+            if (localMedianExcludingCenter(maximum, index, baseline) &&
+                maximum[index] >= baseline + 6.0f) {
+                peakCandidates.push_back({ index, baseline });
+            }
+        }
+        diagnostics.detectedMaximumPeaks = peakCandidates.size();
+
+        std::array<std::vector<double>, V13_REDUCER_COUNT> losses;
+        std::array<std::vector<double>, V13_REDUCER_COUNT> localSnrs;
+        for (const PeakCandidate& peak : peakCandidates) {
+            for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT; ++reducer) {
+                const std::vector<float>* trace = robustReducerTrace(diagnostics, reducer);
+                if (!trace || !isValidDbfs((*trace)[peak.index])) {
+                    continue;
+                }
+                float baseline = NO_DATA_DBFS;
+                if (!localMedianExcludingCenter(*trace, peak.index, baseline)) {
+                    continue;
+                }
+                losses[reducer].push_back(
+                    static_cast<double>(maximum[peak.index]) - (*trace)[peak.index]);
+                localSnrs[reducer].push_back(
+                    static_cast<double>((*trace)[peak.index]) - baseline);
+            }
+        }
+
+        for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT; ++reducer) {
+            if (losses[reducer].empty()) {
+                continue;
+            }
+            double lossSum = 0.0;
+            double snrSum = 0.0;
+            std::size_t withinOne = 0;
+            std::size_t withinThree = 0;
+            std::size_t withinSix = 0;
+            for (std::size_t peak = 0; peak < losses[reducer].size(); ++peak) {
+                const double loss = losses[reducer][peak];
+                lossSum += loss;
+                snrSum += localSnrs[reducer][peak];
+                withinOne += loss <= 1.0;
+                withinThree += loss <= 3.0;
+                withinSix += loss <= 6.0;
+            }
+            std::sort(losses[reducer].begin(), losses[reducer].end());
+            PeakPreservationStatistics& statistics =
+                diagnostics.peakPreservation[reducer];
+            statistics.available = true;
+            statistics.measuredPeaks = losses[reducer].size();
+            statistics.averageLossDb =
+                lossSum / static_cast<double>(losses[reducer].size());
+            statistics.medianLossDb = sortedMedian(losses[reducer]);
+            statistics.worstLossDb = losses[reducer].back();
+            statistics.averageLocalSnrDb =
+                snrSum / static_cast<double>(localSnrs[reducer].size());
+            statistics.withinOneDbPercent =
+                100.0 * static_cast<double>(withinOne) /
+                static_cast<double>(losses[reducer].size());
+            statistics.withinThreeDbPercent =
+                100.0 * static_cast<double>(withinThree) /
+                static_cast<double>(losses[reducer].size());
+            statistics.withinSixDbPercent =
+                100.0 * static_cast<double>(withinSix) /
+                static_cast<double>(losses[reducer].size());
+
+            if (diagnostics.difference[reducer].available) {
+                ReducerDiagnosticScore& score = diagnostics.score[reducer];
+                score.available = true;
+                // Diagnostic-only score: 10 dB of average MAX suppression and
+                // zero average peak loss each map to 100. The combined score is
+                // their equal-weight mean; it never selects a production reducer.
+                score.artifactSuppressionScore = std::clamp(
+                    diagnostics.difference[reducer].averageDifferenceDb * 10.0,
+                    0.0, 100.0);
+                score.peakPreservationScore = std::clamp(
+                    100.0 - (statistics.averageLossDb * (100.0 / 6.0)),
+                    0.0, 100.0);
+                score.combinedScore =
+                    (score.artifactSuppressionScore + score.peakPreservationScore) * 0.5;
+            }
+        }
+
+        std::sort(peakCandidates.begin(), peakCandidates.end(),
+                  [&maximum](const PeakCandidate& first,
+                             const PeakCandidate& second) {
+                      return maximum[first.index] > maximum[second.index];
+                  });
+        const double wideBinWidthHz =
+            (settings.stopHz - settings.startHz) /
+            static_cast<double>(maximum.size());
+        const std::size_t reportedPeaks = std::min(
+            V13_TOP_PEAK_COUNT, peakCandidates.size());
+        diagnostics.strongestPeaks.reserve(reportedPeaks);
+        for (std::size_t peakIndex = 0; peakIndex < reportedPeaks; ++peakIndex) {
+            const PeakCandidate& candidate = peakCandidates[peakIndex];
+            RobustPeakDiagnostic peak;
+            peak.levelsDbfs.fill(NO_DATA_DBFS);
+            peak.lossesDb.fill(std::numeric_limits<double>::quiet_NaN());
+            peak.localSnrDb.fill(std::numeric_limits<double>::quiet_NaN());
+            peak.wideBinIndex = candidate.index;
+            peak.frequencyHz = settings.startHz +
+                               ((static_cast<double>(candidate.index) + 0.5) *
+                                wideBinWidthHz);
+            peak.maximumBaselineDbfs = candidate.baseline;
+            peak.contributor = reducers.contributors[candidate.index];
+            for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT; ++reducer) {
+                const std::vector<float>* trace = robustReducerTrace(diagnostics, reducer);
+                if (!trace || !isValidDbfs((*trace)[candidate.index])) {
+                    continue;
+                }
+                peak.levelsDbfs[reducer] = (*trace)[candidate.index];
+                peak.lossesDb[reducer] =
+                    static_cast<double>(maximum[candidate.index]) -
+                    (*trace)[candidate.index];
+                float baseline = NO_DATA_DBFS;
+                if (localMedianExcludingCenter(*trace, candidate.index, baseline)) {
+                    peak.localSnrDb[reducer] =
+                        static_cast<double>((*trace)[candidate.index]) - baseline;
+                }
+            }
+            diagnostics.strongestPeaks.push_back(peak);
+        }
+        diagnostics.available = true;
+    }
+
     std::size_t mergeSegment(const SweepSettings& settings, double centerHz,
                              const std::vector<float>& fft,
                              std::vector<float>& output,
-                             std::vector<float>& diagnosticMeanOutput,
+                             RobustReducerSweepState& diagnosticReducers,
                              std::vector<float>& quality,
                              SegmentDebugStats& segmentDebugStats,
                              SpectrumArtifactDiagnostics& artifactDiagnostics) const {
-        if (fft.size() < 2 || output.empty() || output.size() != quality.size()) {
+        if (fft.size() < 2 || output.empty() || output.size() != quality.size() ||
+            diagnosticReducers.mean.size() != output.size() ||
+            diagnosticReducers.percentile95.size() != output.size() ||
+            diagnosticReducers.percentile98.size() != output.size() ||
+            diagnosticReducers.top4Mean.size() != output.size() ||
+            diagnosticReducers.top8Mean.size() != output.size() ||
+            diagnosticReducers.contributors.size() != output.size()) {
             return 0;
         }
 
@@ -1666,6 +2054,9 @@ private:
         std::vector<std::size_t> segmentCounts(output.size(), 0);
         std::vector<float> segmentHighest(output.size(), NO_DATA_DBFS);
         std::vector<float> segmentSecondHighest(output.size(), NO_DATA_DBFS);
+        std::vector<std::vector<float>> segmentValues(output.size());
+        const std::size_t expectedRawBinsPerWideBin = std::max<std::size_t>(
+            8, static_cast<std::size_t>(std::ceil(wideBinWidthHz / rawBinWidthHz)) + 2);
         for (std::size_t rawIndex = 0; rawIndex < fft.size(); ++rawIndex) {
             const float candidate = fft[rawIndex];
             if (!isValidDbfs(candidate)) {
@@ -1686,6 +2077,13 @@ private:
             ++contribution.rawBinsUsed;
             segmentSums[wideIndex] += candidate;
             ++segmentCounts[wideIndex];
+            std::vector<float>& values = segmentValues[wideIndex];
+            if (values.empty()) {
+                // Reserve once per touched wide bin. Subsequent raw-bin inserts
+                // remain allocation-free at the expected FFT/wide-bin ratio.
+                values.reserve(expectedRawBinsPerWideBin);
+            }
+            values.push_back(candidate);
             if (!std::isfinite(segmentHighest[wideIndex]) ||
                 candidate > segmentHighest[wideIndex]) {
                 segmentSecondHighest[wideIndex] = segmentHighest[wideIndex];
@@ -1728,6 +2126,55 @@ private:
             contribution.minimumRawBinsPerWideBin = 0;
         }
 
+        std::vector<WideBinReducerContributor> segmentContributors(output.size());
+        for (std::size_t wideIndex : hitWideBins) {
+            std::vector<float>& values = segmentValues[wideIndex];
+            const std::size_t count = values.size();
+            if (count == 0) {
+                continue;
+            }
+
+            WideBinReducerContributor& reducer = segmentContributors[wideIndex];
+            reducer.contributingRawBins = count;
+            reducer.meanDbfs = static_cast<float>(
+                segmentSums[wideIndex] / static_cast<double>(count));
+
+            const std::size_t percentile95Index = std::min(
+                count - 1,
+                static_cast<std::size_t>(std::ceil(0.95 * static_cast<double>(count))) - 1);
+            std::nth_element(values.begin(), values.begin() + percentile95Index,
+                             values.end());
+            reducer.percentile95Dbfs = values[percentile95Index];
+            const std::size_t percentile98Index = std::min(
+                count - 1,
+                static_cast<std::size_t>(std::ceil(0.98 * static_cast<double>(count))) - 1);
+            std::nth_element(values.begin(), values.begin() + percentile98Index,
+                             values.end());
+            reducer.percentile98Dbfs = values[percentile98Index];
+
+            const std::size_t topCount = std::min<std::size_t>(8, count);
+            std::partial_sort(values.begin(), values.begin() + topCount, values.end(),
+                              std::greater<float>());
+            reducer.highestRawDbfs = values[0];
+            reducer.secondHighestRawDbfs = count >= 2 ? values[1] : NO_DATA_DBFS;
+            reducer.fourthHighestRawDbfs = count >= 4 ? values[3] : NO_DATA_DBFS;
+            reducer.eighthHighestRawDbfs = count >= 8 ? values[7] : NO_DATA_DBFS;
+
+            double top4Sum = 0.0;
+            const std::size_t top4Count = std::min<std::size_t>(4, count);
+            for (std::size_t index = 0; index < top4Count; ++index) {
+                top4Sum += values[index];
+            }
+            double top8Sum = top4Sum;
+            for (std::size_t index = top4Count; index < topCount; ++index) {
+                top8Sum += values[index];
+            }
+            reducer.top4MeanDbfs = static_cast<float>(
+                top4Sum / static_cast<double>(top4Count));
+            reducer.top8MeanDbfs = static_cast<float>(
+                top8Sum / static_cast<double>(topCount));
+        }
+
         std::size_t writtenBins = 0;
         for (std::size_t wideIndex = 0; wideIndex < output.size(); ++wideIndex) {
             const float level = segmentSpectrum[wideIndex];
@@ -1744,12 +2191,18 @@ private:
             }
 
             output[wideIndex] = level;
-            if (diagnosticMeanOutput.size() == output.size() &&
-                segmentCounts[wideIndex] > 0) {
-                diagnosticMeanOutput[wideIndex] = static_cast<float>(
-                    segmentSums[wideIndex] /
-                    static_cast<double>(segmentCounts[wideIndex]));
-            }
+            diagnosticReducers.mean[wideIndex] =
+                segmentContributors[wideIndex].meanDbfs;
+            diagnosticReducers.percentile95[wideIndex] =
+                segmentContributors[wideIndex].percentile95Dbfs;
+            diagnosticReducers.percentile98[wideIndex] =
+                segmentContributors[wideIndex].percentile98Dbfs;
+            diagnosticReducers.top4Mean[wideIndex] =
+                segmentContributors[wideIndex].top4MeanDbfs;
+            diagnosticReducers.top8Mean[wideIndex] =
+                segmentContributors[wideIndex].top8MeanDbfs;
+            diagnosticReducers.contributors[wideIndex] =
+                segmentContributors[wideIndex];
             quality[wideIndex] = segmentQuality;
             ++writtenBins;
         }
@@ -1776,19 +2229,19 @@ private:
 
         artifactDiagnostics.contribution = contribution;
         artifactDiagnostics.mergedWideMaximum = output;
-        artifactDiagnostics.mergedWideMean = diagnosticMeanOutput;
+        artifactDiagnostics.mergedWideMean = diagnosticReducers.mean;
         double maxMinusMeanSum = 0.0;
         std::size_t aboveThreeDb = 0;
         std::size_t aboveSixDb = 0;
         for (std::size_t wideIndex = 0;
-             wideIndex < output.size() && wideIndex < diagnosticMeanOutput.size();
+             wideIndex < output.size() && wideIndex < diagnosticReducers.mean.size();
              ++wideIndex) {
             if (!isValidDbfs(output[wideIndex]) ||
-                !isValidDbfs(diagnosticMeanOutput[wideIndex])) {
+                !isValidDbfs(diagnosticReducers.mean[wideIndex])) {
                 continue;
             }
             const double difference = static_cast<double>(output[wideIndex]) -
-                                      static_cast<double>(diagnosticMeanOutput[wideIndex]);
+                                      static_cast<double>(diagnosticReducers.mean[wideIndex]);
             maxMinusMeanSum += difference;
             aboveThreeDb += difference > 3.0;
             aboveSixDb += difference > 6.0;
@@ -1805,6 +2258,9 @@ private:
                 100.0 * static_cast<double>(aboveSixDb) /
                 static_cast<double>(artifactDiagnostics.maxMeanComparableBins);
         }
+        computeRobustReducerDiagnostics(
+            settings, output, diagnosticReducers,
+            artifactDiagnostics.robustReducers);
         return writtenBins;
     }
 
@@ -2204,7 +2660,8 @@ private:
 
     void drawV12SpectrumGraph(const char* title, const char* id,
                               const std::vector<float>& primary,
-                              const std::vector<float>* secondary = nullptr) {
+                              const std::vector<float>* secondary = nullptr,
+                              const char* secondaryLabel = "wideMean") {
         ImGui::TextUnformatted(title);
         const float scale = style::uiScale;
         const ImVec2 canvasPosition = ImGui::GetCursorScreenPos();
@@ -2274,9 +2731,12 @@ private:
         drawTrace(primary, IM_COL32(50, 225, 155, 255), 1.2f);
         if (secondary) {
             drawTrace(*secondary, IM_COL32(80, 155, 255, 235), 1.0f);
+            char legend[96];
+            std::snprintf(legend, sizeof(legend),
+                          "green: MAX | blue: %s", secondaryLabel);
             drawList->AddText(
                 ImVec2(plotMin.x + (4.0f * scale), plotMin.y + (2.0f * scale)),
-                IM_COL32(205, 215, 225, 255), "green: wideMax | blue: wideMean");
+                IM_COL32(205, 215, 225, 255), legend);
         }
         if (primary.empty()) {
             drawList->AddText(
@@ -2296,6 +2756,258 @@ private:
             label, comparison.meanAbsoluteDifferenceDb,
             comparison.withinOneDbPercent, comparison.withinThreeDbPercent,
             comparison.comparedBins);
+    }
+
+    static void drawReducerContributor(
+        const WideBinReducerContributor& contributor) {
+        ImGui::TextWrapped(
+            "contributors=%zu | highest/2nd/4th/8th %.3f / %.3f / %.3f / %.3f "
+            "dBFS | P95/P98/mean %.3f / %.3f / %.3f dBFS",
+            contributor.contributingRawBins,
+            contributor.highestRawDbfs,
+            contributor.secondHighestRawDbfs,
+            contributor.fourthHighestRawDbfs,
+            contributor.eighthHighestRawDbfs,
+            contributor.percentile95Dbfs,
+            contributor.percentile98Dbfs,
+            contributor.meanDbfs);
+    }
+
+    void drawRobustReducerDiagnostics(
+        const RobustReducerDiagnostics& diagnostics) {
+        if (!ImGui::CollapsingHeader("V13 Robust reducer diagnostic",
+                                     ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+        if (!diagnostics.available) {
+            ImGui::TextDisabled("Waiting for mapped direct FFT data.");
+            return;
+        }
+
+        ImGui::TextUnformatted(
+            "Production Combined Spectrum remains MAX; comparison is diagnostic only.");
+        int comparisonSelection = std::clamp(
+            v13ComparisonReducer - static_cast<int>(V13_REDUCER_MEAN), 0, 4);
+        if (ImGui::Combo(("Comparison reducer##wsm_v13_reducer_" + name).c_str(),
+                         &comparisonSelection,
+                         "MEAN\0P95\0P98\0TOP4_MEAN\0TOP8_MEAN\0")) {
+            v13ComparisonReducer = comparisonSelection +
+                                   static_cast<int>(V13_REDUCER_MEAN);
+        }
+        const std::size_t selectedReducer = static_cast<std::size_t>(
+            std::clamp(v13ComparisonReducer,
+                       static_cast<int>(V13_REDUCER_MEAN),
+                       static_cast<int>(V13_REDUCER_TOP8)));
+        const std::vector<float>* selectedTrace =
+            robustReducerTrace(diagnostics, selectedReducer);
+        const std::string graphTitle =
+            std::string("MAX vs ") + robustReducerName(selectedReducer) +
+            " (same wide bins)";
+        drawV12SpectrumGraph(
+            graphTitle.c_str(), "v13_reducer", diagnostics.maximum,
+            selectedTrace, robustReducerName(selectedReducer));
+
+        const ImGuiTableFlags tableFlags =
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_SizingStretchProp;
+        ImGui::TextUnformatted("MAX minus reducer across mapped wide bins");
+        if (ImGui::BeginTable("##wsm_v13_differences", 8, tableFlags)) {
+            ImGui::TableSetupColumn("Reducer");
+            ImGui::TableSetupColumn("Mean");
+            ImGui::TableSetupColumn("Median");
+            ImGui::TableSetupColumn("P90");
+            ImGui::TableSetupColumn(">3%");
+            ImGui::TableSetupColumn(">6%");
+            ImGui::TableSetupColumn(">10%");
+            ImGui::TableSetupColumn("Bins");
+            ImGui::TableHeadersRow();
+            for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT; ++reducer) {
+                const ReducerDifferenceStatistics& statistics =
+                    diagnostics.difference[reducer];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(robustReducerName(reducer));
+                if (!statistics.available) {
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted("n/a");
+                    continue;
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.2f", statistics.averageDifferenceDb);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.2f", statistics.medianDifferenceDb);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%.2f", statistics.percentile90DifferenceDb);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%.1f", statistics.aboveThreeDbPercent);
+                ImGui::TableSetColumnIndex(5);
+                ImGui::Text("%.1f", statistics.aboveSixDbPercent);
+                ImGui::TableSetColumnIndex(6);
+                ImGui::Text("%.1f", statistics.aboveTenDbPercent);
+                ImGui::TableSetColumnIndex(7);
+                ImGui::Text("%zu", statistics.comparedBins);
+            }
+            ImGui::EndTable();
+        }
+
+        ImGui::Text("MAX local peaks >=6 dB over median baseline (+/-5): %zu",
+                    diagnostics.detectedMaximumPeaks);
+        if (ImGui::BeginTable("##wsm_v13_peaks", 9, tableFlags)) {
+            ImGui::TableSetupColumn("Reducer");
+            ImGui::TableSetupColumn("Avg loss");
+            ImGui::TableSetupColumn("Median");
+            ImGui::TableSetupColumn("Worst");
+            ImGui::TableSetupColumn("Avg SNR");
+            ImGui::TableSetupColumn("<=1%");
+            ImGui::TableSetupColumn("<=3%");
+            ImGui::TableSetupColumn("<=6%");
+            ImGui::TableSetupColumn("Peaks");
+            ImGui::TableHeadersRow();
+            for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT; ++reducer) {
+                const PeakPreservationStatistics& statistics =
+                    diagnostics.peakPreservation[reducer];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(robustReducerName(reducer));
+                if (!statistics.available) {
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted("n/a");
+                    continue;
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.2f", statistics.averageLossDb);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.2f", statistics.medianLossDb);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%.2f", statistics.worstLossDb);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%.2f", statistics.averageLocalSnrDb);
+                ImGui::TableSetColumnIndex(5);
+                ImGui::Text("%.1f", statistics.withinOneDbPercent);
+                ImGui::TableSetColumnIndex(6);
+                ImGui::Text("%.1f", statistics.withinThreeDbPercent);
+                ImGui::TableSetColumnIndex(7);
+                ImGui::Text("%.1f", statistics.withinSixDbPercent);
+                ImGui::TableSetColumnIndex(8);
+                ImGui::Text("%zu", statistics.measuredPeaks);
+            }
+            ImGui::EndTable();
+        }
+
+        ImGui::TextUnformatted("Descriptive reducer scores (no automatic selection)");
+        ImGui::TextDisabled(
+            "Suppression=min(100, mean difference/10 dB*100); preservation="
+            "max(0, 100-average peak loss/6 dB*100); combined=equal-weight mean.");
+        if (ImGui::BeginTable("##wsm_v13_scores", 4, tableFlags)) {
+            ImGui::TableSetupColumn("Reducer");
+            ImGui::TableSetupColumn("Suppression");
+            ImGui::TableSetupColumn("Preservation");
+            ImGui::TableSetupColumn("Combined");
+            ImGui::TableHeadersRow();
+            for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT; ++reducer) {
+                const ReducerDiagnosticScore& score = diagnostics.score[reducer];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(robustReducerName(reducer));
+                ImGui::TableSetColumnIndex(1);
+                if (!score.available) {
+                    ImGui::TextUnformatted("n/a");
+                    continue;
+                }
+                ImGui::Text("%.1f", score.artifactSuppressionScore);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.1f", score.peakPreservationScore);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%.1f", score.combinedScore);
+            }
+            ImGui::EndTable();
+        }
+
+        ImGui::Separator();
+        ImGui::InputDouble(
+            ("Reference frequency MHz##wsm_v13_reference_" + name).c_str(),
+            &v13ReferenceFrequencyMHz, 0.001, 0.01, "%.6f");
+        const double referenceHz = v13ReferenceFrequencyMHz * 1e6;
+        if (referenceHz >= diagnostics.startHz && referenceHz < diagnostics.stopHz &&
+            !diagnostics.maximum.empty()) {
+            const double binWidthHz =
+                (diagnostics.stopHz - diagnostics.startHz) /
+                static_cast<double>(diagnostics.maximum.size());
+            const std::size_t centerBin = std::min(
+                diagnostics.maximum.size() - 1,
+                static_cast<std::size_t>(
+                    std::floor((referenceHz - diagnostics.startHz) / binWidthHz)));
+            ImGui::Text("Reference wide bin: %zu (no tuner action)", centerBin);
+            if (ImGui::BeginTable("##wsm_v13_reference_bins", 5, tableFlags)) {
+                ImGui::TableSetupColumn("Bin / MHz");
+                ImGui::TableSetupColumn("Reducer");
+                ImGui::TableSetupColumn("Level");
+                ImGui::TableSetupColumn("MAX diff");
+                ImGui::TableSetupColumn("Offset");
+                ImGui::TableHeadersRow();
+                const std::size_t firstBin = centerBin > 0 ? centerBin - 1 : centerBin;
+                const std::size_t lastBin = std::min(
+                    diagnostics.maximum.size() - 1, centerBin + 1);
+                for (std::size_t bin = firstBin; bin <= lastBin; ++bin) {
+                    const double frequencyHz = diagnostics.startHz +
+                                               ((static_cast<double>(bin) + 0.5) *
+                                                binWidthHz);
+                    for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT;
+                         ++reducer) {
+                        const std::vector<float>* trace =
+                            robustReducerTrace(diagnostics, reducer);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::Text("%zu / %.6f", bin, frequencyHz / 1e6);
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted(robustReducerName(reducer));
+                        ImGui::TableSetColumnIndex(2);
+                        if (!trace || !isValidDbfs((*trace)[bin])) {
+                            ImGui::TextUnformatted("n/a");
+                            continue;
+                        }
+                        ImGui::Text("%.3f", (*trace)[bin]);
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::Text("%.3f",
+                                    diagnostics.maximum[bin] - (*trace)[bin]);
+                        ImGui::TableSetColumnIndex(4);
+                        ImGui::Text("%+.0f", static_cast<double>(bin) -
+                                                 static_cast<double>(centerBin));
+                    }
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TextUnformatted("Reference-bin raw contributors");
+            drawReducerContributor(diagnostics.contributors[centerBin]);
+        }
+        else {
+            ImGui::TextDisabled(
+                "Enter a frequency inside the current sweep range for bin details.");
+        }
+
+        if (ImGui::TreeNode("Strongest 10 MAX peaks and contributors")) {
+            for (std::size_t peakIndex = 0;
+                 peakIndex < diagnostics.strongestPeaks.size(); ++peakIndex) {
+                const RobustPeakDiagnostic& peak =
+                    diagnostics.strongestPeaks[peakIndex];
+                ImGui::Text("#%zu bin %zu @ %.6f MHz | MAX baseline %.3f dBFS",
+                            peakIndex + 1, peak.wideBinIndex,
+                            peak.frequencyHz / 1e6, peak.maximumBaselineDbfs);
+                drawReducerContributor(peak.contributor);
+                for (std::size_t reducer = 0; reducer < V13_REDUCER_COUNT;
+                     ++reducer) {
+                    ImGui::TextWrapped(
+                        "  %s level %.3f dBFS | MAX loss %.3f dB | local SNR %.3f dB",
+                        robustReducerName(reducer), peak.levelsDbfs[reducer],
+                        peak.lossesDb[reducer], peak.localSnrDb[reducer]);
+                }
+                ImGui::Separator();
+            }
+            if (diagnostics.strongestPeaks.empty()) {
+                ImGui::TextDisabled("No qualifying MAX peaks in current data.");
+            }
+            ImGui::TreePop();
+        }
     }
 
     void drawSpectrumArtifactDiagnostics(
@@ -2582,6 +3294,8 @@ private:
         ImGui::Separator();
         drawSpectrumArtifactDiagnostics(artifactDiagnostics);
         ImGui::Separator();
+        drawRobustReducerDiagnostics(artifactDiagnostics.robustReducers);
+        ImGui::Separator();
         ImGui::TextUnformatted("FFT source: private IQFrontEnd stream (V10 lifecycle)");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
         ImGui::Text("Direct FFT bin count: %zu", segmentDebugStats.rawFftBinCount);
@@ -2789,6 +3503,8 @@ private:
     SegmentDebugStats currentSegmentDebugStats;
     SpectrumArtifactDiagnostics currentArtifactDiagnostics;
     std::vector<SegmentBoundaryDiagnostic> activeSegmentBoundaries;
+    int v13ComparisonReducer = V13_REDUCER_P98;
+    double v13ReferenceFrequencyMHz = 0.0;
 
     double returnFrequencyHz = 0.0;
     double pendingTuneHz = 0.0;
