@@ -10,6 +10,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -28,6 +29,7 @@
 #include <gui/tuner.h>
 #include <imgui.h>
 #include <module.h>
+#include <radio_interface.h>
 #include <signal_path/signal_path.h>
 #include <utils/flog.h>
 #include <volk/volk.h>
@@ -54,6 +56,7 @@ namespace {
     constexpr std::size_t V12_WIDE_SAMPLE_COUNT = 16;
     constexpr std::size_t V13_REDUCER_COUNT = 6;
     constexpr std::size_t V13_TOP_PEAK_COUNT = 10;
+    constexpr double AIRBAND_CHANNEL_STEP_HZ = 25000.0 / 3.0;
     constexpr double USABLE_BANDWIDTH_RATIO = 0.85;
     constexpr float GRAPH_MIN_DB = -120.0f;
     constexpr float GRAPH_MAX_DB = 0.0f;
@@ -71,13 +74,36 @@ namespace {
         float overlapPercent = 10.0f;
         int tuningTimeMs = 120;
         int fftAveraging = 3;
-        float thresholdDbfs = -55.0f;
         bool peakHold = true;
+        double initialFrequencyHz = 0.0;
     };
 
     struct DetectedPeak {
         double frequencyHz = 0.0;
+        double rawFrequencyHz = 0.0;
+        double snappedFrequencyHz = 0.0;
         float levelDbfs = GRAPH_MIN_DB;
+        std::size_t displayWideBinIndex = 0;
+        std::size_t rawFftBinIndex = 0;
+        double segmentCenterHz = 0.0;
+        double sampleRateHz = 0.0;
+        std::size_t rawFftSize = 0;
+    };
+
+    struct WideBinPeakSource {
+        bool valid = false;
+        std::size_t rawFftBinIndex = 0;
+        double segmentCenterHz = 0.0;
+        double sampleRateHz = 0.0;
+        std::size_t rawFftSize = 0;
+        double rawFrequencyHz = 0.0;
+    };
+
+    struct SavedPeak {
+        std::string name;
+        double frequencyHz = 0.0;
+        float levelDbfs = NO_DATA_DBFS;
+        double channelStepHz = 0.0;
     };
 
     struct SpectrumDebugStats {
@@ -383,7 +409,27 @@ namespace {
     enum class PendingTuneReason {
         NONE,
         RESTORE_AFTER_STOP,
-        SELECTED_PEAK
+        SELECTED_PEAK,
+        SAVED_PEAK,
+        PAUSE_CURRENT
+    };
+
+    enum class SweepOperationalState {
+        STOPPED,
+        RUNNING_FORWARD,
+        RUNNING_REVERSE,
+        PAUSED
+    };
+
+    enum ChannelStepOption {
+        CHANNEL_STEP_1_KHZ = 0,
+        CHANNEL_STEP_5_KHZ,
+        CHANNEL_STEP_8_33_KHZ,
+        CHANNEL_STEP_10_KHZ,
+        CHANNEL_STEP_12_5_KHZ,
+        CHANNEL_STEP_25_KHZ,
+        CHANNEL_STEP_CUSTOM,
+        CHANNEL_STEP_OPTION_COUNT
     };
 
     const char* iqCaptureEndReasonText(IQCaptureEndReason reason) {
@@ -868,9 +914,33 @@ private:
         fftAveraging = config.conf["fftAveraging"];
         thresholdDbfs = config.conf["thresholdDbfs"];
         peakHoldEnabled = config.conf["peakHold"];
+        channelStepOption = config.conf.value("channelStepOption",
+                                              static_cast<int>(CHANNEL_STEP_5_KHZ));
+        customChannelStepKhz = config.conf.value("customChannelStepKhz", 5.0);
+        snapDetectedPeaks = config.conf.value("snapDetectedPeaks", true);
+        savedPeaks.clear();
+        if (config.conf.contains("savedPeaks") && config.conf["savedPeaks"].is_array()) {
+            for (const json& entry : config.conf["savedPeaks"]) {
+                if (!entry.is_object()) {
+                    continue;
+                }
+                SavedPeak peak;
+                peak.name = entry.value("name", std::string());
+                peak.frequencyHz = entry.value("frequencyHz", 0.0);
+                peak.levelDbfs =
+                    entry.contains("levelDbfs") && entry["levelDbfs"].is_number()
+                        ? entry["levelDbfs"].get<float>()
+                        : NO_DATA_DBFS;
+                peak.channelStepHz = entry.value("channelStepHz", 0.0);
+                if (std::isfinite(peak.frequencyHz) && peak.frequencyHz > 0.0) {
+                    savedPeaks.push_back(std::move(peak));
+                }
+            }
+        }
         config.release();
 
         sanitizeControls();
+        publishLiveOperationalControls();
     }
 
     void saveConfig() {
@@ -882,6 +952,22 @@ private:
         config.conf["fftAveraging"] = fftAveraging;
         config.conf["thresholdDbfs"] = thresholdDbfs;
         config.conf["peakHold"] = peakHoldEnabled;
+        config.conf["channelStepOption"] = channelStepOption;
+        config.conf["customChannelStepKhz"] = customChannelStepKhz;
+        config.conf["snapDetectedPeaks"] = snapDetectedPeaks;
+        json savedPeakArray = json::array();
+        for (const SavedPeak& peak : savedPeaks) {
+            json entry = {
+                { "name", peak.name },
+                { "frequencyHz", peak.frequencyHz },
+                { "channelStepHz", peak.channelStepHz }
+            };
+            if (std::isfinite(peak.levelDbfs)) {
+                entry["levelDbfs"] = peak.levelDbfs;
+            }
+            savedPeakArray.push_back(std::move(entry));
+        }
+        config.conf["savedPeaks"] = std::move(savedPeakArray);
         config.release(true);
     }
 
@@ -892,79 +978,330 @@ private:
         tuningTimeMs = std::clamp(tuningTimeMs, 10, 2000);
         fftAveraging = std::clamp(fftAveraging, 1, 10);
         thresholdDbfs = std::clamp(thresholdDbfs, -150.0f, 0.0f);
+        channelStepOption = std::clamp(
+            channelStepOption, 0, static_cast<int>(CHANNEL_STEP_OPTION_COUNT) - 1);
+        customChannelStepKhz = std::clamp(customChannelStepKhz, 0.001, 1000.0);
+    }
+
+    double selectedChannelStepHz() const {
+        static const double stepsHz[CHANNEL_STEP_OPTION_COUNT] = {
+            1000.0,
+            5000.0,
+            AIRBAND_CHANNEL_STEP_HZ,
+            10000.0,
+            12500.0,
+            25000.0,
+            0.0
+        };
+        if (channelStepOption == CHANNEL_STEP_CUSTOM) {
+            return customChannelStepKhz * 1000.0;
+        }
+        return stepsHz[std::clamp(
+            channelStepOption, 0,
+            static_cast<int>(CHANNEL_STEP_OPTION_COUNT) - 1)];
+    }
+
+    static double snapFrequencyToChannel(double frequencyHz, double stepHz) {
+        if (!std::isfinite(frequencyHz) || !std::isfinite(stepHz) || stepHz <= 0.0) {
+            return frequencyHz;
+        }
+        return std::round(frequencyHz / stepHz) * stepHz;
+    }
+
+    void publishLiveOperationalControls() {
+        const double stepHz = selectedChannelStepHz();
+        liveThresholdDbfs.store(thresholdDbfs, std::memory_order_relaxed);
+        liveChannelStepHz.store(stepHz, std::memory_order_relaxed);
+        liveSnapDetectedPeaks.store(snapDetectedPeaks, std::memory_order_relaxed);
+
+        const std::string selectedVfo = gui::waterfall.selectedVFO;
+        const auto selected = gui::waterfall.vfos.find(selectedVfo);
+        if (!selectedVfo.empty() && selected != gui::waterfall.vfos.end() &&
+            selected->second &&
+            (selectedVfo != appliedChannelStepVfo ||
+             std::abs(stepHz - appliedChannelStepHz) > 0.001)) {
+            // SDR++'s normal keyboard/mouse frequency navigation reads this
+            // snap interval. 8.33 kHz is represented exactly as 25 kHz / 3.
+            selected->second->setSnapInterval(stepHz);
+            appliedChannelStepVfo = selectedVfo;
+            appliedChannelStepHz = stepHz;
+        }
+    }
+
+    bool selectedRadioVfo(std::string& vfoName) const {
+        vfoName = gui::waterfall.selectedVFO;
+        return !vfoName.empty() && core::modComManager.interfaceExists(vfoName) &&
+               core::modComManager.getModuleName(vfoName) == "radio";
+    }
+
+    void refreshSquelchControl() {
+        std::string selectedVfo;
+        squelchAvailable = selectedRadioVfo(selectedVfo);
+        if (!squelchAvailable) {
+            squelchVfoName.clear();
+            return;
+        }
+        if (selectedVfo == squelchVfoName && squelchControlInitialized) {
+            return;
+        }
+        float level = -50.0f;
+        if (core::modComManager.callInterface(
+                selectedVfo, RADIO_IFACE_CMD_GET_SQUELCH_LEVEL, nullptr, &level)) {
+            squelchDb = level;
+            squelchVfoName = selectedVfo;
+            squelchControlInitialized = true;
+        }
+    }
+
+    void applySquelchControl() {
+        std::string selectedVfo;
+        if (!selectedRadioVfo(selectedVfo)) {
+            squelchAvailable = false;
+            return;
+        }
+        squelchDb = std::clamp(squelchDb, -150.0f, 0.0f);
+        float level = squelchDb;
+        squelchAvailable = core::modComManager.callInterface(
+            selectedVfo, RADIO_IFACE_CMD_SET_SQUELCH_LEVEL, &level, nullptr);
+        if (squelchAvailable) {
+            squelchVfoName = selectedVfo;
+            squelchControlInitialized = true;
+        }
+    }
+
+    static const char* operationalStateText(SweepOperationalState state) {
+        switch (state) {
+        case SweepOperationalState::RUNNING_FORWARD:
+            return "Forward";
+        case SweepOperationalState::RUNNING_REVERSE:
+            return "Reverse";
+        case SweepOperationalState::PAUSED:
+            return "Paused";
+        case SweepOperationalState::STOPPED:
+        default:
+            return "Stopped";
+        }
+    }
+
+    void requestPauseAndTune(double frequencyHz, PendingTuneReason reason) {
+        if (!std::isfinite(frequencyHz) || frequencyHz <= 0.0) {
+            return;
+        }
+        if (sweepRequested.load()) {
+            sweepState.store(SweepOperationalState::PAUSED,
+                             std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(displayMutex);
+                statusText = "Pausing for selected frequency";
+            }
+            requestCv.notify_all();
+        }
+        pendingTuneHz = frequencyHz;
+        pendingTuneReason = reason;
+    }
+
+    void selectDetectedPeak(const DetectedPeak& peak) {
+        pendingPeak = peak;
+        pendingPeakName.fill('\0');
+        requestPauseAndTune(peak.frequencyHz,
+                            PendingTuneReason::SELECTED_PEAK);
     }
 
     void drawMenu() {
         applyPendingTune();
+        refreshSquelchControl();
+        publishLiveOperationalControls();
 
-        const bool sweepBusy = sweepRequested.load() || workerActive.load();
+        const bool sweepActive = sweepRequested.load();
+        const bool stopping = !sweepActive && workerActive.load();
         bool configChanged = false;
+        bool operationalControlChanged = false;
 
-        if (sweepBusy) {
+        if (sweepActive || stopping) {
             ImGui::BeginDisabled();
         }
-
-        ImGui::TextUnformatted("Start Frequency (MHz)");
-        ImGui::SetNextItemWidth(-1.0f);
-        configChanged |= ImGui::InputDouble(("##wsm_start_" + name).c_str(), &startFrequencyMHz, 0.1, 1.0, "%.6f");
-
-        ImGui::TextUnformatted("Stop Frequency (MHz)");
-        ImGui::SetNextItemWidth(-1.0f);
-        configChanged |= ImGui::InputDouble(("##wsm_stop_" + name).c_str(), &stopFrequencyMHz, 0.1, 1.0, "%.6f");
-
-        ImGui::TextUnformatted("Sweep Overlap");
-        ImGui::SetNextItemWidth(-1.0f);
-        configChanged |= ImGui::SliderFloat(("##wsm_overlap_" + name).c_str(), &overlapPercent, 0.0f, 50.0f, "%.1f %%");
-
-        ImGui::TextUnformatted("Settling / Tuning Time");
-        ImGui::SetNextItemWidth(-1.0f);
-        configChanged |= ImGui::SliderInt(("##wsm_settle_" + name).c_str(), &tuningTimeMs, 10, 2000, "%d ms");
-
-        ImGui::TextUnformatted("FFT Averaging");
-        ImGui::SetNextItemWidth(-1.0f);
-        configChanged |= ImGui::SliderInt(("##wsm_average_" + name).c_str(), &fftAveraging, 1, 10, "%d frames");
-
-        ImGui::TextUnformatted("Detection Threshold");
-        ImGui::SetNextItemWidth(-1.0f);
-        configChanged |= ImGui::SliderFloat(("##wsm_threshold_" + name).c_str(), &thresholdDbfs, -150.0f, 0.0f, "%.1f dBFS");
-
-        configChanged |= ImGui::Checkbox(("Peak Hold##wsm_peak_hold_" + name).c_str(), &peakHoldEnabled);
-
-        if (sweepBusy) {
+        if (ImGui::BeginTable(("##wsm_range_controls_" + name).c_str(), 2,
+                              ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Start MHz");
+            ImGui::SetNextItemWidth(-1.0f);
+            configChanged |= ImGui::InputDouble(
+                ("##wsm_start_" + name).c_str(), &startFrequencyMHz,
+                0.1, 1.0, "%.6f");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Stop MHz");
+            ImGui::SetNextItemWidth(-1.0f);
+            configChanged |= ImGui::InputDouble(
+                ("##wsm_stop_" + name).c_str(), &stopFrequencyMHz,
+                0.1, 1.0, "%.6f");
+            ImGui::EndTable();
+        }
+        if (sweepActive || stopping) {
             ImGui::EndDisabled();
         }
 
-        if (configChanged) {
+        ImGui::TextUnformatted("Channel Step");
+        ImGui::SetNextItemWidth(-1.0f);
+        operationalControlChanged |= ImGui::Combo(
+            ("##wsm_channel_step_" + name).c_str(), &channelStepOption,
+            "1.00 kHz\0 5.00 kHz\0 8.33 kHz (25/3)\0 10.00 kHz\0 12.50 kHz\0 25.00 kHz\0 Custom\0");
+        if (channelStepOption == CHANNEL_STEP_CUSTOM) {
+            ImGui::TextUnformatted("Custom step (kHz)");
+            ImGui::SetNextItemWidth(-1.0f);
+            operationalControlChanged |= ImGui::InputDouble(
+                ("##wsm_custom_step_" + name).c_str(), &customChannelStepKhz,
+                0.1, 1.0, "%.3f");
+        }
+        operationalControlChanged |= ImGui::Checkbox(
+            ("Snap detected peaks to channel step##wsm_snap_peaks_" + name).c_str(),
+            &snapDetectedPeaks);
+
+        if (ImGui::BeginTable(("##wsm_live_controls_" + name).c_str(), 3,
+                              ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Threshold dBFS");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::InputFloat(
+                    ("##wsm_threshold_" + name).c_str(), &thresholdDbfs,
+                    1.0f, 5.0f, "%.1f",
+                    ImGuiInputTextFlags_CharsDecimal)) {
+                operationalControlChanged = true;
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Squelch dB");
+            if (!squelchAvailable) {
+                ImGui::BeginDisabled();
+            }
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::InputFloat(
+                    ("##wsm_squelch_" + name).c_str(), &squelchDb,
+                    1.0f, 5.0f, "%.1f",
+                    ImGuiInputTextFlags_CharsDecimal)) {
+                applySquelchControl();
+            }
+            if (!squelchAvailable) {
+                ImGui::EndDisabled();
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Gain dB");
+            ImGui::BeginDisabled();
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputDouble(("##wsm_gain_" + name).c_str(), &gainDisplayDb,
+                               1.0, 5.0, "%.1f");
+            ImGui::EndDisabled();
+            ImGui::EndTable();
+        }
+        if (!squelchAvailable) {
+            ImGui::TextDisabled("Squelch: select an active Radio VFO.");
+        }
+        ImGui::TextDisabled(
+            "Gain: source controlled; no safe generic read/capability API.");
+
+        if (configChanged || operationalControlChanged) {
             sanitizeControls();
+            publishLiveOperationalControls();
             saveConfig();
         }
 
-        const float width = ImGui::GetContentRegionAvail().x;
-        if (!sweepBusy) {
-            if (ImGui::Button(("Start Sweep##wsm_start_button_" + name).c_str(), ImVec2(width, 0.0f))) {
-                startSweep();
-            }
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float buttonWidth =
+            std::max(45.0f * style::uiScale,
+                     (ImGui::GetContentRegionAvail().x - (3.0f * spacing)) / 4.0f);
+        const ImVec2 buttonSize(buttonWidth, 36.0f * style::uiScale);
+        if (stopping) {
+            ImGui::BeginDisabled();
         }
-        else if (ImGui::Button(("Stop Sweep##wsm_stop_button_" + name).c_str(), ImVec2(width, 0.0f))) {
+        if (ImGui::Button(("<< Reverse##wsm_reverse_" + name).c_str(), buttonSize)) {
+            requestSweepDirection(SweepOperationalState::RUNNING_REVERSE);
+        }
+        if (stopping) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (!sweepActive) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button(("Pause##wsm_pause_" + name).c_str(), buttonSize)) {
+            requestPauseAtCurrentFrequency();
+        }
+        if (!sweepActive) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (stopping) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button(("Forward >>##wsm_forward_" + name).c_str(), buttonSize)) {
+            requestSweepDirection(SweepOperationalState::RUNNING_FORWARD);
+        }
+        if (stopping) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (!sweepActive) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button(("Stop##wsm_stop_" + name).c_str(), buttonSize)) {
             requestStop("Stopped");
             pendingTuneHz = returnFrequencyHz;
             pendingTuneReason = PendingTuneReason::RESTORE_AFTER_STOP;
         }
-
-        if (ImGui::Button(("Clear Peaks##wsm_clear_" + name).c_str(), ImVec2(width, 0.0f))) {
-            clearPeaks();
+        if (!sweepActive) {
+            ImGui::EndDisabled();
         }
 
         drawStatus();
         drawSpectrumGraph();
         drawPeakTable();
+        drawPeakActionPopup();
+        drawSavedPeaks();
+
+        if (ImGui::CollapsingHeader("Advanced Sweep Settings")) {
+            if (sweepActive || stopping) {
+                ImGui::BeginDisabled();
+            }
+            ImGui::TextUnformatted("Sweep Overlap");
+            ImGui::SetNextItemWidth(-1.0f);
+            configChanged = ImGui::SliderFloat(
+                                ("##wsm_overlap_" + name).c_str(), &overlapPercent,
+                                0.0f, 50.0f, "%.1f %%") ||
+                            configChanged;
+            ImGui::TextUnformatted("Settling / Tuning Time");
+            ImGui::SetNextItemWidth(-1.0f);
+            configChanged = ImGui::SliderInt(
+                                ("##wsm_settle_" + name).c_str(), &tuningTimeMs,
+                                10, 2000, "%d ms") ||
+                            configChanged;
+            ImGui::TextUnformatted("FFT Averaging");
+            ImGui::SetNextItemWidth(-1.0f);
+            configChanged = ImGui::SliderInt(
+                                ("##wsm_average_" + name).c_str(), &fftAveraging,
+                                1, 10, "%d frames") ||
+                            configChanged;
+            configChanged = ImGui::Checkbox(
+                                ("Peak Hold##wsm_peak_hold_" + name).c_str(),
+                                &peakHoldEnabled) ||
+                            configChanged;
+            if (sweepActive || stopping) {
+                ImGui::EndDisabled();
+            }
+            if (configChanged) {
+                sanitizeControls();
+                saveConfig();
+            }
+            const float width = ImGui::GetContentRegionAvail().x;
+            if (ImGui::Button(("Clear Peaks##wsm_clear_" + name).c_str(),
+                              ImVec2(width, 0.0f))) {
+                clearPeaks();
+            }
+        }
         drawDebugInfo();
 
         ImGui::Spacing();
         ImGui::TextWrapped("Uses the active source sample rate and the central 85%% of every FFT segment. RTL AGC and Tuner AGC are never changed.");
     }
 
-    void startSweep() {
+    void startSweep(SweepOperationalState initialState) {
         sanitizeControls();
         saveConfig();
 
@@ -1000,8 +1337,13 @@ private:
         settings.overlapPercent = overlapPercent;
         settings.tuningTimeMs = tuningTimeMs;
         settings.fftAveraging = fftAveraging;
-        settings.thresholdDbfs = thresholdDbfs;
         settings.peakHold = peakHoldEnabled;
+        settings.initialFrequencyHz = gui::waterfall.getCenterFrequency();
+        const auto selectedVfo =
+            gui::waterfall.vfos.find(gui::waterfall.selectedVFO);
+        if (selectedVfo != gui::waterfall.vfos.end() && selectedVfo->second) {
+            settings.initialFrequencyHz += selectedVfo->second->generalOffset;
+        }
 
         if (!std::isfinite(settings.startHz) || !std::isfinite(settings.stopHz) || settings.stopHz <= settings.startHz) {
             setError("Stop frequency must be higher than start frequency");
@@ -1020,7 +1362,9 @@ private:
         {
             std::lock_guard<std::mutex> lock(displayMutex);
             lastError.clear();
-            statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
+            statusText = initialState == SweepOperationalState::RUNNING_REVERSE
+                             ? "Sweeping reverse"
+                             : "Sweeping forward";
             activeSampleRateHz = sampleRateHz;
             activeUsableBandwidthHz = sampleRateHz * USABLE_BANDWIDTH_RATIO;
             activeSegmentStepHz = activeUsableBandwidthHz * (1.0 - (overlapPercent / 100.0));
@@ -1030,6 +1374,7 @@ private:
             currentArtifactDiagnostics = {};
             activeSegmentBoundaries.clear();
         }
+        sweepState.store(initialState, std::memory_order_release);
         sweepRequested.store(true);
         requestCv.notify_all();
         flog::info("Wide Spectrum Monitor: Starting {:.3f}-{:.3f} MHz at {:.3f} MS/s",
@@ -1037,6 +1382,7 @@ private:
     }
 
     void requestStop(const std::string& status) {
+        sweepState.store(SweepOperationalState::STOPPED, std::memory_order_release);
         const bool wasRequested = sweepRequested.exchange(false);
         requestCv.notify_all();
         iqCaptureCv.notify_all();
@@ -1047,7 +1393,16 @@ private:
     }
 
     void applyPendingTune() {
-        if (pendingTuneHz <= 0.0 || workerActive.load() || sweepRequested.load()) {
+        if (pendingTuneHz <= 0.0) {
+            return;
+        }
+        if (pendingTuneReason == PendingTuneReason::RESTORE_AFTER_STOP &&
+            workerActive.load()) {
+            return;
+        }
+        const SweepOperationalState state = sweepState.load(std::memory_order_acquire);
+        if ((workerActive.load() && !workerPaused.load()) ||
+            (sweepRequested.load() && state != SweepOperationalState::PAUSED)) {
             return;
         }
 
@@ -1058,15 +1413,57 @@ private:
         tuner::centerTuning(gui::waterfall.selectedVFO, targetHz);
         {
             std::lock_guard<std::mutex> lock(displayMutex);
-            statusText = (reason == PendingTuneReason::SELECTED_PEAK) ? "Tuned to selected frequency" : "Stopped";
+            if (reason == PendingTuneReason::RESTORE_AFTER_STOP) {
+                statusText = "Stopped";
+            }
+            else {
+                statusText = "Paused on selected frequency";
+            }
             currentCenterHz = targetHz;
         }
         if (reason == PendingTuneReason::SELECTED_PEAK) {
+            openPeakPopup = true;
             flog::info("Wide Spectrum Monitor: Tuned to selected peak {:.6f} MHz", targetHz / 1e6);
         }
-        else {
+        else if (reason == PendingTuneReason::RESTORE_AFTER_STOP) {
             flog::info("Wide Spectrum Monitor: Restored pre-sweep frequency {:.6f} MHz", targetHz / 1e6);
         }
+    }
+
+    void requestSweepDirection(SweepOperationalState direction) {
+        pendingTuneHz = 0.0;
+        pendingTuneReason = PendingTuneReason::NONE;
+        if (!sweepRequested.load()) {
+            if (!workerActive.load()) {
+                startSweep(direction);
+            }
+            return;
+        }
+        sweepState.store(direction, std::memory_order_release);
+        requestCv.notify_all();
+        std::lock_guard<std::mutex> lock(displayMutex);
+        statusText = direction == SweepOperationalState::RUNNING_FORWARD
+                         ? "Sweeping forward"
+                         : "Sweeping reverse";
+    }
+
+    void requestPauseAtCurrentFrequency() {
+        if (!sweepRequested.load()) {
+            return;
+        }
+        double centerHz = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(displayMutex);
+            centerHz = currentCenterHz;
+            statusText = "Pausing";
+        }
+        sweepState.store(SweepOperationalState::PAUSED, std::memory_order_release);
+        if (centerHz > 0.0) {
+            pendingTuneHz = centerHz;
+            pendingTuneReason = PendingTuneReason::PAUSE_CURRENT;
+        }
+        requestCv.notify_all();
+        iqCaptureCv.notify_all();
     }
 
     void clearPeaks() {
@@ -1077,6 +1474,7 @@ private:
     }
 
     void setError(const std::string& error) {
+        sweepState.store(SweepOperationalState::STOPPED, std::memory_order_release);
         sweepRequested.store(false);
         requestCv.notify_all();
         iqCaptureCv.notify_all();
@@ -1099,6 +1497,7 @@ private:
                 }
                 settings = queuedSettings;
                 workerActive.store(true);
+                workerPaused.store(false);
             }
 
             try {
@@ -1111,6 +1510,7 @@ private:
                 setError("Sweep worker failed with an unknown error");
             }
             stopIQCapturePath();
+            workerPaused.store(false);
             workerActive.store(false);
         }
         workerActive.store(false);
@@ -1127,105 +1527,185 @@ private:
             std::lock_guard<std::mutex> lock(displayMutex);
             segmentCount = static_cast<int>(centers.size());
             activeSegmentBoundaries = buildSegmentBoundaries(settings, centers);
-            statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
+            statusText = sweepState.load(std::memory_order_relaxed) ==
+                                 SweepOperationalState::RUNNING_REVERSE
+                             ? "Sweeping reverse"
+                             : "Sweeping forward";
         }
 
-        while (sweepRequested.load() && !shuttingDown.load()) {
-            // These buffers live for the entire sweep. Segments only merge into
-            // them; no reducer trace is reset inside the segment loop.
-            std::vector<float> cycleSpectrum(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            RobustReducerSweepState cycleReducers;
+        std::vector<float> cycleSpectrum;
+        RobustReducerSweepState cycleReducers;
+        std::vector<float> cycleQuality;
+        std::vector<WideBinPeakSource> cyclePeakSources;
+        std::vector<bool> capturedSegments;
+        SpectrumDebugStats cycleDebugStats;
+        std::size_t capturedSegmentCount = 0;
+        auto sweepStartedAt = std::chrono::steady_clock::now();
+        auto resetCycle = [&]() {
+            cycleSpectrum.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
             cycleReducers.mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
             cycleReducers.percentile95.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
             cycleReducers.percentile98.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
             cycleReducers.top4Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
             cycleReducers.top8Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            cycleReducers.contributors.resize(WIDE_BIN_COUNT);
-            std::vector<float> cycleQuality(WIDE_BIN_COUNT, -1.0f);
-            SpectrumDebugStats cycleDebugStats;
-            bool capturedAnySegment = false;
-            const auto sweepStartedAt = std::chrono::steady_clock::now();
+            cycleReducers.contributors.assign(WIDE_BIN_COUNT, {});
+            cycleQuality.assign(WIDE_BIN_COUNT, -1.0f);
+            cyclePeakSources.assign(WIDE_BIN_COUNT, {});
+            capturedSegments.assign(centers.size(), false);
+            capturedSegmentCount = 0;
+            cycleDebugStats = {};
+            sweepStartedAt = std::chrono::steady_clock::now();
+        };
+        resetCycle();
 
-            for (std::size_t segmentIndex = 0; segmentIndex < centers.size(); ++segmentIndex) {
+        const SweepOperationalState initialState =
+            sweepState.load(std::memory_order_acquire);
+        std::size_t segmentIndex = 0;
+        if (initialState == SweepOperationalState::RUNNING_REVERSE) {
+            const auto firstHigher = std::upper_bound(
+                centers.begin(), centers.end(), settings.initialFrequencyHz);
+            segmentIndex = firstHigher == centers.begin()
+                               ? centers.size() - 1
+                               : static_cast<std::size_t>(
+                                     std::distance(centers.begin(), firstHigher) - 1);
+        }
+        else {
+            const auto firstAtOrHigher = std::lower_bound(
+                centers.begin(), centers.end(), settings.initialFrequencyHz);
+            segmentIndex = firstAtOrHigher == centers.end()
+                               ? 0
+                               : static_cast<std::size_t>(
+                                     std::distance(centers.begin(), firstAtOrHigher));
+        }
+        bool firstTuneDiagnosticPending = true;
+
+        while (sweepRequested.load() && !shuttingDown.load()) {
+            if (!waitForRunningState()) {
+                break;
+            }
+
+            const double centerHz = centers[segmentIndex];
+            {
+                std::lock_guard<std::mutex> lock(displayMutex);
+                currentSegment = static_cast<int>(segmentIndex) + 1;
+                currentCenterHz = centerHz;
+                statusText = "Settling";
+            }
+
+            if (firstTuneDiagnosticPending) {
+                captureSplitterDiagnosticCheckpoint(beforeFirstTuneCheckpoint, true);
+            }
+            sigpath::sourceManager.tune(centerHz);
+            if (firstTuneDiagnosticPending) {
+                captureSplitterDiagnosticCheckpoint(immediatelyAfterFirstTuneCheckpoint, true);
+            }
+            if (!waitFor(std::chrono::milliseconds(settings.tuningTimeMs))) {
+                if (sweepState.load(std::memory_order_acquire) ==
+                    SweepOperationalState::PAUSED) {
+                    continue;
+                }
+                break;
+            }
+            if (firstTuneDiagnosticPending) {
+                captureSplitterDiagnosticCheckpoint(afterFirstTuneSettlingCheckpoint, true);
+                firstTuneDiagnosticPending = false;
+            }
+
+            SegmentDebugStats segmentDebugStats;
+            segmentDebugStats.segmentNumber = static_cast<int>(segmentIndex) + 1;
+            std::vector<float> averagedFFT;
+            SpectrumArtifactDiagnostics artifactDiagnostics;
+            if (!captureAveragedFFT(settings.fftAveraging, settings.sampleRateHz,
+                                    centerHz, averagedFFT, cycleDebugStats,
+                                    segmentDebugStats, artifactDiagnostics)) {
                 if (!sweepRequested.load() || shuttingDown.load()) {
                     break;
                 }
-
-                const double centerHz = centers[segmentIndex];
-                {
-                    std::lock_guard<std::mutex> lock(displayMutex);
-                    currentSegment = static_cast<int>(segmentIndex) + 1;
-                    currentCenterHz = centerHz;
-                    statusText = "Settling";
-                }
-
-                if (segmentIndex == 0) {
-                    captureSplitterDiagnosticCheckpoint(beforeFirstTuneCheckpoint, true);
-                }
-                sigpath::sourceManager.tune(centerHz);
-                if (segmentIndex == 0) {
-                    captureSplitterDiagnosticCheckpoint(immediatelyAfterFirstTuneCheckpoint, true);
-                }
-                if (!waitFor(std::chrono::milliseconds(settings.tuningTimeMs))) {
-                    break;
-                }
-                if (segmentIndex == 0) {
-                    captureSplitterDiagnosticCheckpoint(afterFirstTuneSettlingCheckpoint, true);
-                }
-
-                SegmentDebugStats segmentDebugStats;
-                segmentDebugStats.segmentNumber = static_cast<int>(segmentIndex) + 1;
-                std::vector<float> averagedFFT;
-                SpectrumArtifactDiagnostics artifactDiagnostics;
-                if (!captureAveragedFFT(settings.fftAveraging, settings.sampleRateHz,
-                                        centerHz, averagedFFT, cycleDebugStats,
-                                        segmentDebugStats, artifactDiagnostics)) {
-                    if (!sweepRequested.load() || shuttingDown.load()) {
-                        break;
-                    }
-                    setError("No FFT data is available from the active source");
-                    return;
-                }
-
-                segmentDebugStats.wideBinsWritten = mergeSegment(
-                    settings, centerHz, averagedFFT, cycleSpectrum, cycleReducers,
-                    cycleQuality, segmentDebugStats, artifactDiagnostics);
-                segmentDebugStats.accumulatedUniqueWideBins = static_cast<std::size_t>(std::count_if(
-                    cycleSpectrum.begin(), cycleSpectrum.end(), [](float value) { return isValidDbfs(value); }));
-                segmentDebugStats.wideBinsTotal = cycleSpectrum.size();
-                if (segmentDebugStats.wideBinsTotal > 0) {
-                    segmentDebugStats.coveragePercent =
-                        100.0f * static_cast<float>(segmentDebugStats.accumulatedUniqueWideBins) /
-                        static_cast<float>(segmentDebugStats.wideBinsTotal);
-                }
-                capturedAnySegment = true;
-                {
-                    std::lock_guard<std::mutex> lock(displayMutex);
-                    currentSegmentDebugStats = segmentDebugStats;
-                    currentArtifactDiagnostics = std::move(artifactDiagnostics);
-                    statusText = completedSweepValid ? "Sweeping" : "Waiting for first complete sweep";
-                }
-            }
-
-            if (!sweepRequested.load() || shuttingDown.load()) {
-                break;
-            }
-            if (!capturedAnySegment) {
-                setError("Sweep completed without FFT data");
+                setError("No FFT data is available from the active source");
                 return;
             }
 
-            const double sweepSeconds = std::chrono::duration<double>(
-                                            std::chrono::steady_clock::now() - sweepStartedAt)
-                                            .count();
-            publishSweep(settings, std::move(cycleSpectrum), sweepSeconds, cycleDebugStats);
+            segmentDebugStats.wideBinsWritten = mergeSegment(
+                settings, centerHz, averagedFFT, cycleSpectrum, cycleReducers,
+                cycleQuality, cyclePeakSources, segmentDebugStats,
+                artifactDiagnostics);
+            if (!capturedSegments[segmentIndex]) {
+                capturedSegments[segmentIndex] = true;
+                ++capturedSegmentCount;
+            }
+            segmentDebugStats.accumulatedUniqueWideBins =
+                static_cast<std::size_t>(std::count_if(
+                    cycleSpectrum.begin(), cycleSpectrum.end(),
+                    [](float value) { return isValidDbfs(value); }));
+            segmentDebugStats.wideBinsTotal = cycleSpectrum.size();
+            if (segmentDebugStats.wideBinsTotal > 0) {
+                segmentDebugStats.coveragePercent =
+                    100.0f *
+                    static_cast<float>(segmentDebugStats.accumulatedUniqueWideBins) /
+                    static_cast<float>(segmentDebugStats.wideBinsTotal);
+            }
+            {
+                std::lock_guard<std::mutex> lock(displayMutex);
+                currentSegmentDebugStats = segmentDebugStats;
+                currentArtifactDiagnostics = std::move(artifactDiagnostics);
+                const SweepOperationalState state =
+                    sweepState.load(std::memory_order_relaxed);
+                statusText = state == SweepOperationalState::RUNNING_REVERSE
+                                 ? "Sweeping reverse"
+                             : state == SweepOperationalState::PAUSED
+                                 ? "Pausing"
+                                 : "Sweeping forward";
+            }
+
+            if (capturedSegmentCount == centers.size()) {
+                const double sweepSeconds = std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() -
+                                                sweepStartedAt)
+                                                .count();
+                publishSweep(settings, std::move(cycleSpectrum),
+                             std::move(cyclePeakSources), sweepSeconds,
+                             cycleDebugStats);
+                resetCycle();
+            }
+
+            const SweepOperationalState direction =
+                sweepState.load(std::memory_order_acquire);
+            if (direction == SweepOperationalState::RUNNING_FORWARD) {
+                segmentIndex = (segmentIndex + 1) % centers.size();
+            }
+            else if (direction == SweepOperationalState::RUNNING_REVERSE) {
+                segmentIndex = segmentIndex == 0 ? centers.size() - 1
+                                                 : segmentIndex - 1;
+            }
         }
+    }
+
+    bool waitForRunningState() {
+        std::unique_lock<std::mutex> lock(requestMutex);
+        while (sweepRequested.load() && !shuttingDown.load() &&
+               sweepState.load(std::memory_order_acquire) ==
+                   SweepOperationalState::PAUSED) {
+            workerPaused.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> displayLock(displayMutex);
+                statusText = "Paused";
+            }
+            requestCv.wait(lock, [this]() {
+                return shuttingDown.load() || !sweepRequested.load() ||
+                       sweepState.load(std::memory_order_acquire) !=
+                           SweepOperationalState::PAUSED;
+            });
+        }
+        workerPaused.store(false, std::memory_order_release);
+        return sweepRequested.load() && !shuttingDown.load();
     }
 
     bool waitFor(std::chrono::milliseconds duration) {
         std::unique_lock<std::mutex> lock(requestMutex);
         const bool interrupted = requestCv.wait_for(lock, duration, [this]() {
-            return shuttingDown.load() || !sweepRequested.load();
+            return shuttingDown.load() || !sweepRequested.load() ||
+                   sweepState.load(std::memory_order_acquire) ==
+                       SweepOperationalState::PAUSED;
         });
         return !interrupted;
     }
@@ -2010,9 +2490,11 @@ private:
                              std::vector<float>& output,
                              RobustReducerSweepState& diagnosticReducers,
                              std::vector<float>& quality,
+                             std::vector<WideBinPeakSource>& peakSources,
                              SegmentDebugStats& segmentDebugStats,
                              SpectrumArtifactDiagnostics& artifactDiagnostics) const {
         if (fft.size() < 2 || output.empty() || output.size() != quality.size() ||
+            peakSources.size() != output.size() ||
             diagnosticReducers.mean.size() != output.size() ||
             diagnosticReducers.percentile95.size() != output.size() ||
             diagnosticReducers.percentile98.size() != output.size() ||
@@ -2054,6 +2536,7 @@ private:
         std::vector<std::size_t> segmentCounts(output.size(), 0);
         std::vector<float> segmentHighest(output.size(), NO_DATA_DBFS);
         std::vector<float> segmentSecondHighest(output.size(), NO_DATA_DBFS);
+        std::vector<WideBinPeakSource> segmentPeakSources(output.size());
         std::vector<std::vector<float>> segmentValues(output.size());
         const std::size_t expectedRawBinsPerWideBin = std::max<std::size_t>(
             8, static_cast<std::size_t>(std::ceil(wideBinWidthHz / rawBinWidthHz)) + 2);
@@ -2096,6 +2579,17 @@ private:
             float& segmentLevel = segmentSpectrum[wideIndex];
             if (!std::isfinite(segmentLevel) || candidate > segmentLevel) {
                 segmentLevel = candidate;
+                WideBinPeakSource& peakSource = segmentPeakSources[wideIndex];
+                peakSource.valid = true;
+                peakSource.rawFftBinIndex = rawIndex;
+                peakSource.segmentCenterHz = centerHz;
+                peakSource.sampleRateHz = settings.sampleRateHz;
+                peakSource.rawFftSize = fft.size();
+                // computeDirectFFT() multiplies time samples by (-1)^n before
+                // FFTW. This shifts DC to output bin N/2, so bin k represents
+                // center-Fs/2 + k*Fs/N (not the 2048-bin display midpoint).
+                peakSource.rawFrequencyHz =
+                    rawStartHz + (static_cast<double>(rawIndex) * rawBinWidthHz);
             }
         }
 
@@ -2203,6 +2697,7 @@ private:
                 segmentContributors[wideIndex].top8MeanDbfs;
             diagnosticReducers.contributors[wideIndex] =
                 segmentContributors[wideIndex];
+            peakSources[wideIndex] = segmentPeakSources[wideIndex];
             quality[wideIndex] = segmentQuality;
             ++writtenBins;
         }
@@ -2264,8 +2759,9 @@ private:
         return writtenBins;
     }
 
-    void publishSweep(const SweepSettings& settings, std::vector<float> spectrum, double sweepSeconds,
-                      SpectrumDebugStats debugStats) {
+    void publishSweep(const SweepSettings& settings, std::vector<float> spectrum,
+                      std::vector<WideBinPeakSource> peakSources,
+                      double sweepSeconds, SpectrumDebugStats debugStats) {
         debugStats.totalWideBins = spectrum.size();
         for (float level : spectrum) {
             if (!isValidDbfs(level)) {
@@ -2291,7 +2787,15 @@ private:
             return;
         }
 
-        std::vector<DetectedPeak> peaks = detectPeaks(settings, spectrum);
+        const float detectionThreshold =
+            liveThresholdDbfs.load(std::memory_order_relaxed);
+        const double channelStepHz =
+            liveChannelStepHz.load(std::memory_order_relaxed);
+        const bool snapPeaks =
+            liveSnapDetectedPeaks.load(std::memory_order_relaxed);
+        std::vector<DetectedPeak> peaks = detectPeaks(
+            spectrum, peakSources, detectionThreshold, channelStepHz,
+            snapPeaks);
         std::lock_guard<std::mutex> lock(displayMutex);
         const bool rangeChanged = !completedSweepValid ||
                                   std::abs(displayedStartHz - settings.startHz) > 1.0 ||
@@ -2305,11 +2809,16 @@ private:
         activeUsableBandwidthHz = settings.sampleRateHz * USABLE_BANDWIDTH_RATIO;
         activeSegmentStepHz = activeUsableBandwidthHz * (1.0 - (settings.overlapPercent / 100.0));
         completedSweepValid = true;
-        currentSegment = segmentCount;
         lastSweepSeconds = sweepSeconds;
         sweepsPerMinute = (sweepSeconds > 0.0) ? (60.0 / sweepSeconds) : 0.0;
         ++completedSweeps;
-        statusText = "Sweeping";
+        const SweepOperationalState state =
+            sweepState.load(std::memory_order_relaxed);
+        statusText = state == SweepOperationalState::RUNNING_REVERSE
+                         ? "Sweeping reverse"
+                     : state == SweepOperationalState::PAUSED
+                         ? "Paused"
+                         : "Sweeping forward";
 
         if (settings.peakHold) {
             if (rangeChanged || peakSpectrum.size() != completedSweep.size()) {
@@ -2335,34 +2844,52 @@ private:
         lastDebugStats = debugStats;
     }
 
-    std::vector<DetectedPeak> detectPeaks(const SweepSettings& settings, const std::vector<float>& spectrum) const {
+    std::vector<DetectedPeak> detectPeaks(
+        const std::vector<float>& spectrum,
+        const std::vector<WideBinPeakSource>& peakSources,
+        float detectionThresholdDbfs, double channelStepHz,
+        bool snapPeaks) const {
         std::vector<DetectedPeak> candidates;
-        if (spectrum.size() < 3) {
+        if (spectrum.size() < 3 || peakSources.size() != spectrum.size()) {
             return candidates;
         }
 
-        const double binWidthHz = (settings.stopHz - settings.startHz) / spectrum.size();
         for (std::size_t i = 1; i + 1 < spectrum.size(); ++i) {
             const float level = spectrum[i];
             if (!isValidDbfs(spectrum[i - 1]) || !isValidDbfs(level) || !isValidDbfs(spectrum[i + 1])) {
                 continue;
             }
-            if (level < settings.thresholdDbfs || level < spectrum[i - 1] || level <= spectrum[i + 1]) {
+            if (level < detectionThresholdDbfs || level < spectrum[i - 1] ||
+                level <= spectrum[i + 1] || !peakSources[i].valid) {
                 continue;
             }
-            candidates.push_back({ settings.startHz + ((static_cast<double>(i) + 0.5) * binWidthHz), level });
+            const WideBinPeakSource& source = peakSources[i];
+            DetectedPeak peak;
+            peak.rawFrequencyHz = source.rawFrequencyHz;
+            peak.snappedFrequencyHz = snapFrequencyToChannel(
+                source.rawFrequencyHz, channelStepHz);
+            peak.frequencyHz = snapPeaks ? peak.snappedFrequencyHz
+                                         : peak.rawFrequencyHz;
+            peak.levelDbfs = level;
+            peak.displayWideBinIndex = i;
+            peak.rawFftBinIndex = source.rawFftBinIndex;
+            peak.segmentCenterHz = source.segmentCenterHz;
+            peak.sampleRateHz = source.sampleRateHz;
+            peak.rawFftSize = source.rawFftSize;
+            candidates.push_back(peak);
         }
 
         std::sort(candidates.begin(), candidates.end(), [](const DetectedPeak& lhs, const DetectedPeak& rhs) {
             return lhs.levelDbfs > rhs.levelDbfs;
         });
 
-        const double mergeDistanceHz = std::max(250000.0, binWidthHz * 3.0);
+        const double mergeDistanceHz = std::max(1.0, channelStepHz * 1.05);
         std::vector<DetectedPeak> strongest;
         strongest.reserve(20);
         for (const DetectedPeak& candidate : candidates) {
             const bool nearExisting = std::any_of(strongest.begin(), strongest.end(), [&](const DetectedPeak& existing) {
-                return std::abs(existing.frequencyHz - candidate.frequencyHz) < mergeDistanceHz;
+                return std::abs(existing.frequencyHz - candidate.frequencyHz) <=
+                       mergeDistanceHz;
             });
             if (!nearExisting) {
                 strongest.push_back(candidate);
@@ -2399,6 +2926,9 @@ private:
 
         ImGui::Separator();
         ImGui::Text("Status: %s", status.c_str());
+        ImGui::Text("Direction: %s",
+                    operationalStateText(
+                        sweepState.load(std::memory_order_acquire)));
         if (totalSegments > 0) {
             ImGui::Text("Segment: %d / %d | Sweeps: %d", segment, totalSegments, sweeps);
         }
@@ -2579,7 +3109,7 @@ private:
             return;
         }
 
-        ImGui::TableSetupColumn("Frequency MHz", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Frequency MHz", ImGuiTableColumnFlags_WidthStretch, 2.8f);
         ImGui::TableSetupColumn("Level dBFS", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableHeadersRow();
         for (std::size_t i = 0; i < peaks.size(); ++i) {
@@ -2588,15 +3118,127 @@ private:
             char frequencyLabel[96];
             std::snprintf(frequencyLabel, sizeof(frequencyLabel), "%.6f##wsm_peak_%zu_%s", peaks[i].frequencyHz / 1e6, i, name.c_str());
             if (ImGui::Selectable(frequencyLabel, false, ImGuiSelectableFlags_SpanAllColumns)) {
-                requestStop("Stopped");
-                pendingTuneHz = peaks[i].frequencyHz;
-                pendingTuneReason = PendingTuneReason::SELECTED_PEAK;
+                selectDetectedPeak(peaks[i]);
             }
+            ImGui::TextDisabled("Raw %.6f | snapped %.6f",
+                                peaks[i].rawFrequencyHz / 1e6,
+                                peaks[i].snappedFrequencyHz / 1e6);
+            ImGui::TextDisabled("error %+.3f kHz | raw bin %zu",
+                                (peaks[i].snappedFrequencyHz - peaks[i].rawFrequencyHz) / 1e3,
+                                peaks[i].rawFftBinIndex);
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("%.1f", peaks[i].levelDbfs);
         }
         ImGui::EndTable();
-        ImGui::TextDisabled("Tap a row to stop the sweep and tune SDR++.");
+        ImGui::TextDisabled("Tap a row to pause, tune precisely and open peak actions.");
+    }
+
+    void drawPeakActionPopup() {
+        const std::string popupId = "Detected Peak##wsm_peak_popup_" + name;
+        if (openPeakPopup) {
+            ImGui::OpenPopup(popupId.c_str());
+            openPeakPopup = false;
+        }
+        if (!ImGui::BeginPopupModal(
+                popupId.c_str(), nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize)) {
+            return;
+        }
+
+        ImGui::Text("Frequency: %.6f MHz", pendingPeak.frequencyHz / 1e6);
+        ImGui::Text("Level: %.1f dBFS", pendingPeak.levelDbfs);
+        ImGui::TextDisabled("Raw: %.6f MHz | snapped: %.6f MHz | error: %+.3f kHz",
+                            pendingPeak.rawFrequencyHz / 1e6,
+                            pendingPeak.snappedFrequencyHz / 1e6,
+                            (pendingPeak.snappedFrequencyHz -
+                             pendingPeak.rawFrequencyHz) /
+                                1e3);
+        ImGui::TextUnformatted("Name");
+        ImGui::SetNextItemWidth(320.0f * style::uiScale);
+        ImGui::InputText(("##wsm_peak_name_" + name).c_str(),
+                         pendingPeakName.data(), pendingPeakName.size());
+
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float buttonWidth =
+            (ImGui::GetContentRegionAvail().x - (2.0f * spacing)) / 3.0f;
+        if (ImGui::Button(("Save##wsm_peak_save_" + name).c_str(),
+                          ImVec2(buttonWidth, 0.0f))) {
+            SavedPeak saved;
+            saved.name = pendingPeakName.data();
+            saved.frequencyHz = pendingPeak.frequencyHz;
+            saved.levelDbfs = pendingPeak.levelDbfs;
+            saved.channelStepHz = selectedChannelStepHz();
+            savedPeaks.push_back(std::move(saved));
+            saveConfig();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(("Tune only##wsm_peak_tune_" + name).c_str(),
+                          ImVec2(buttonWidth, 0.0f))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(("Cancel##wsm_peak_cancel_" + name).c_str(),
+                          ImVec2(buttonWidth, 0.0f))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    void drawSavedPeaks() {
+        if (!ImGui::CollapsingHeader("Saved Peaks",
+                                     ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+        if (savedPeaks.empty()) {
+            ImGui::TextDisabled("No saved peaks.");
+            return;
+        }
+
+        const ImGuiTableFlags flags =
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_SizingStretchProp;
+        std::size_t deleteIndex = savedPeaks.size();
+        if (ImGui::BeginTable(("##wsm_saved_peaks_" + name).c_str(), 4, flags)) {
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Frequency MHz");
+            ImGui::TableSetupColumn("Level");
+            ImGui::TableSetupColumn("Remove");
+            ImGui::TableHeadersRow();
+            for (std::size_t index = 0; index < savedPeaks.size(); ++index) {
+                const SavedPeak& peak = savedPeaks[index];
+                ImGui::PushID(static_cast<int>(index));
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(peak.name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                char frequencyLabel[64];
+                std::snprintf(frequencyLabel, sizeof(frequencyLabel),
+                              "%.6f##saved_frequency", peak.frequencyHz / 1e6);
+                if (ImGui::Selectable(frequencyLabel)) {
+                    requestPauseAndTune(peak.frequencyHz,
+                                        PendingTuneReason::SAVED_PEAK);
+                }
+                ImGui::TableSetColumnIndex(2);
+                if (isValidDbfs(peak.levelDbfs)) {
+                    ImGui::Text("%.1f", peak.levelDbfs);
+                }
+                else {
+                    ImGui::TextUnformatted("n/a");
+                }
+                ImGui::TableSetColumnIndex(3);
+                if (ImGui::SmallButton("Delete")) {
+                    deleteIndex = index;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (deleteIndex < savedPeaks.size()) {
+            savedPeaks.erase(savedPeaks.begin() + deleteIndex);
+            saveConfig();
+        }
+        ImGui::TextDisabled("Tap a frequency to pause and tune; channel step is stored per peak.");
     }
 
     static const char* splitterOutputRole(std::uintptr_t streamAddress,
@@ -3429,10 +4071,33 @@ private:
     int fftAveraging = 3;
     float thresholdDbfs = -55.0f;
     bool peakHoldEnabled = true;
+    int channelStepOption = CHANNEL_STEP_5_KHZ;
+    double customChannelStepKhz = 5.0;
+    bool snapDetectedPeaks = true;
+    std::atomic<float> liveThresholdDbfs{ -55.0f };
+    std::atomic<double> liveChannelStepHz{ 5000.0 };
+    std::atomic<bool> liveSnapDetectedPeaks{ true };
+    std::string appliedChannelStepVfo;
+    double appliedChannelStepHz = 0.0;
+
+    bool squelchAvailable = false;
+    bool squelchControlInitialized = false;
+    std::string squelchVfoName;
+    float squelchDb = -50.0f;
+    double gainDisplayDb = 0.0;
+
+    std::vector<SavedPeak> savedPeaks;
+    DetectedPeak pendingPeak;
+    std::array<char, 128> pendingPeakName{};
+    bool openPeakPopup = false;
 
     std::atomic<bool> shuttingDown{ false };
     std::atomic<bool> sweepRequested{ false };
     std::atomic<bool> workerActive{ false };
+    std::atomic<bool> workerPaused{ false };
+    std::atomic<SweepOperationalState> sweepState{
+        SweepOperationalState::STOPPED
+    };
     std::thread workerThread;
     std::mutex requestMutex;
     std::condition_variable requestCv;
@@ -3521,6 +4186,10 @@ MOD_EXPORT void _INIT_() {
     defaults["fftAveraging"] = 3;
     defaults["thresholdDbfs"] = -55.0;
     defaults["peakHold"] = true;
+    defaults["channelStepOption"] = static_cast<int>(CHANNEL_STEP_5_KHZ);
+    defaults["customChannelStepKhz"] = 5.0;
+    defaults["snapDetectedPeaks"] = true;
+    defaults["savedPeaks"] = json::array();
 
     config.setPath(core::args["root"].s() + "/wide_spectrum_monitor_config.json");
     config.load(defaults);
