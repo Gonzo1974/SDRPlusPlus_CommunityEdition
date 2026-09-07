@@ -82,6 +82,8 @@ namespace {
         double frequencyHz = 0.0;
         double rawFrequencyHz = 0.0;
         double snappedFrequencyHz = 0.0;
+        double channelStepHz = 0.0;
+        bool snapApplied = false;
         float levelDbfs = GRAPH_MIN_DB;
         std::size_t displayWideBinIndex = 0;
         std::size_t rawFftBinIndex = 0;
@@ -103,6 +105,12 @@ namespace {
         std::string name;
         double frequencyHz = 0.0;
         float levelDbfs = NO_DATA_DBFS;
+        double channelStepHz = 0.0;
+    };
+
+    struct SkippedFrequency {
+        std::int64_t frequencyHz = 0;
+        bool snapped = false;
         double channelStepHz = 0.0;
     };
 
@@ -937,13 +945,42 @@ private:
                 }
             }
         }
+        std::vector<SkippedFrequency> loadedSkippedFrequencies;
+        if (config.conf.contains("skippedFrequencies") &&
+            config.conf["skippedFrequencies"].is_array()) {
+            for (const json& entry : config.conf["skippedFrequencies"]) {
+                if (!entry.is_object()) {
+                    continue;
+                }
+                SkippedFrequency skipped;
+                skipped.frequencyHz =
+                    entry.value("frequencyHz", std::int64_t{ 0 });
+                skipped.snapped = entry.value("snapped", false);
+                skipped.channelStepHz = entry.value("channelStepHz", 0.0);
+                if (skipped.frequencyHz > 0 &&
+                    std::isfinite(skipped.channelStepHz) &&
+                    skipped.channelStepHz > 0.0) {
+                    loadedSkippedFrequencies.push_back(skipped);
+                }
+            }
+        }
         config.release();
+
+        {
+            std::lock_guard<std::mutex> lock(skippedFrequenciesMutex);
+            skippedFrequencies = std::move(loadedSkippedFrequencies);
+        }
 
         sanitizeControls();
         publishLiveOperationalControls();
     }
 
     void saveConfig() {
+        std::vector<SkippedFrequency> skippedSnapshot;
+        {
+            std::lock_guard<std::mutex> lock(skippedFrequenciesMutex);
+            skippedSnapshot = skippedFrequencies;
+        }
         config.acquire();
         config.conf["startFrequencyMHz"] = startFrequencyMHz;
         config.conf["stopFrequencyMHz"] = stopFrequencyMHz;
@@ -968,6 +1005,13 @@ private:
             savedPeakArray.push_back(std::move(entry));
         }
         config.conf["savedPeaks"] = std::move(savedPeakArray);
+        json skippedFrequencyArray = json::array();
+        for (const SkippedFrequency& skipped : skippedSnapshot) {
+            skippedFrequencyArray.push_back({ { "frequencyHz", skipped.frequencyHz },
+                                              { "snapped", skipped.snapped },
+                                              { "channelStepHz", skipped.channelStepHz } });
+        }
+        config.conf["skippedFrequencies"] = std::move(skippedFrequencyArray);
         config.release(true);
     }
 
@@ -1006,6 +1050,39 @@ private:
             return frequencyHz;
         }
         return std::round(frequencyHz / stepHz) * stepHz;
+    }
+
+    static bool skippedFrequencyMatchesRaw(
+        const SkippedFrequency& skipped, double rawFrequencyHz) {
+        if (!std::isfinite(rawFrequencyHz) || rawFrequencyHz <= 0.0 ||
+            skipped.frequencyHz <= 0 || !std::isfinite(skipped.channelStepHz) ||
+            skipped.channelStepHz <= 0.0) {
+            return false;
+        }
+        if (skipped.snapped) {
+            const double snappedFrequencyHz = snapFrequencyToChannel(
+                rawFrequencyHz, skipped.channelStepHz);
+            return std::llround(snappedFrequencyHz) == skipped.frequencyHz;
+        }
+        const double toleranceHz =
+            std::max(skipped.channelStepHz * 0.5, 250.0);
+        return std::abs(rawFrequencyHz -
+                        static_cast<double>(skipped.frequencyHz)) <= toleranceHz;
+    }
+
+    static bool isRawFrequencySkipped(
+        double rawFrequencyHz,
+        const std::vector<SkippedFrequency>& skippedFrequencies) {
+        return std::any_of(
+            skippedFrequencies.begin(), skippedFrequencies.end(),
+            [rawFrequencyHz](const SkippedFrequency& skipped) {
+                return skippedFrequencyMatchesRaw(skipped, rawFrequencyHz);
+            });
+    }
+
+    std::vector<SkippedFrequency> snapshotSkippedFrequencies() const {
+        std::lock_guard<std::mutex> lock(skippedFrequenciesMutex);
+        return skippedFrequencies;
     }
 
     void publishLiveOperationalControls() {
@@ -1255,6 +1332,7 @@ private:
         drawPeakTable();
         drawPeakActionPopup();
         drawSavedPeaks();
+        drawSkippedFrequencies();
 
         if (ImGui::CollapsingHeader("Advanced Sweep Settings")) {
             if (sweepActive || stopping) {
@@ -2793,9 +2871,13 @@ private:
             liveChannelStepHz.load(std::memory_order_relaxed);
         const bool snapPeaks =
             liveSnapDetectedPeaks.load(std::memory_order_relaxed);
+        // Keep skip filtering and publication atomic with respect to a UI skip
+        // action. This prevents an in-flight sweep from immediately publishing
+        // a peak that the user just removed.
+        std::unique_lock<std::mutex> skippedLock(skippedFrequenciesMutex);
         std::vector<DetectedPeak> peaks = detectPeaks(
             spectrum, peakSources, detectionThreshold, channelStepHz,
-            snapPeaks);
+            snapPeaks, skippedFrequencies);
         std::lock_guard<std::mutex> lock(displayMutex);
         const bool rangeChanged = !completedSweepValid ||
                                   std::abs(displayedStartHz - settings.startHz) > 1.0 ||
@@ -2848,7 +2930,8 @@ private:
         const std::vector<float>& spectrum,
         const std::vector<WideBinPeakSource>& peakSources,
         float detectionThresholdDbfs, double channelStepHz,
-        bool snapPeaks) const {
+        bool snapPeaks,
+        const std::vector<SkippedFrequency>& skippedFrequencies) const {
         std::vector<DetectedPeak> candidates;
         if (spectrum.size() < 3 || peakSources.size() != spectrum.size()) {
             return candidates;
@@ -2864,12 +2947,18 @@ private:
                 continue;
             }
             const WideBinPeakSource& source = peakSources[i];
+            if (isRawFrequencySkipped(source.rawFrequencyHz,
+                                      skippedFrequencies)) {
+                continue;
+            }
             DetectedPeak peak;
             peak.rawFrequencyHz = source.rawFrequencyHz;
             peak.snappedFrequencyHz = snapFrequencyToChannel(
                 source.rawFrequencyHz, channelStepHz);
             peak.frequencyHz = snapPeaks ? peak.snappedFrequencyHz
                                          : peak.rawFrequencyHz;
+            peak.channelStepHz = channelStepHz;
+            peak.snapApplied = snapPeaks;
             peak.levelDbfs = level;
             peak.displayWideBinIndex = i;
             peak.rawFftBinIndex = source.rawFftBinIndex;
@@ -3120,12 +3209,6 @@ private:
             if (ImGui::Selectable(frequencyLabel, false, ImGuiSelectableFlags_SpanAllColumns)) {
                 selectDetectedPeak(peaks[i]);
             }
-            ImGui::TextDisabled("Raw %.6f | snapped %.6f",
-                                peaks[i].rawFrequencyHz / 1e6,
-                                peaks[i].snappedFrequencyHz / 1e6);
-            ImGui::TextDisabled("error %+.3f kHz | raw bin %zu",
-                                (peaks[i].snappedFrequencyHz - peaks[i].rawFrequencyHz) / 1e3,
-                                peaks[i].rawFftBinIndex);
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("%.1f", peaks[i].levelDbfs);
         }
@@ -3153,6 +3236,7 @@ private:
                             (pendingPeak.snappedFrequencyHz -
                              pendingPeak.rawFrequencyHz) /
                                 1e3);
+        ImGui::TextDisabled("Raw FFT bin: %zu", pendingPeak.rawFftBinIndex);
         ImGui::TextUnformatted("Name");
         ImGui::SetNextItemWidth(320.0f * style::uiScale);
         ImGui::InputText(("##wsm_peak_name_" + name).c_str(),
@@ -3160,7 +3244,7 @@ private:
 
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
         const float buttonWidth =
-            (ImGui::GetContentRegionAvail().x - (2.0f * spacing)) / 3.0f;
+            (ImGui::GetContentRegionAvail().x - (3.0f * spacing)) / 4.0f;
         if (ImGui::Button(("Save##wsm_peak_save_" + name).c_str(),
                           ImVec2(buttonWidth, 0.0f))) {
             SavedPeak saved;
@@ -3170,6 +3254,12 @@ private:
             saved.channelStepHz = selectedChannelStepHz();
             savedPeaks.push_back(std::move(saved));
             saveConfig();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(("Skip Frequency##wsm_peak_skip_" + name).c_str(),
+                          ImVec2(buttonWidth, 0.0f))) {
+            skipDetectedPeak(pendingPeak);
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -3239,6 +3329,103 @@ private:
             saveConfig();
         }
         ImGui::TextDisabled("Tap a frequency to pause and tune; channel step is stored per peak.");
+    }
+
+    void skipDetectedPeak(const DetectedPeak& peak) {
+        if (!std::isfinite(peak.rawFrequencyHz) || peak.rawFrequencyHz <= 0.0 ||
+            !std::isfinite(peak.channelStepHz) || peak.channelStepHz <= 0.0) {
+            return;
+        }
+
+        SkippedFrequency skipped;
+        skipped.snapped = peak.snapApplied;
+        skipped.channelStepHz = peak.channelStepHz;
+        skipped.frequencyHz = std::llround(
+            skipped.snapped ? peak.snappedFrequencyHz : peak.rawFrequencyHz);
+
+        {
+            std::lock_guard<std::mutex> lock(skippedFrequenciesMutex);
+            const bool alreadySkipped = std::any_of(
+                skippedFrequencies.begin(), skippedFrequencies.end(),
+                [&peak](const SkippedFrequency& existing) {
+                    return skippedFrequencyMatchesRaw(existing,
+                                                      peak.rawFrequencyHz);
+                });
+            if (!alreadySkipped) {
+                skippedFrequencies.push_back(skipped);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(displayMutex);
+            detectedPeaks.erase(
+                std::remove_if(
+                    detectedPeaks.begin(), detectedPeaks.end(),
+                    [&skipped](const DetectedPeak& detected) {
+                        return skippedFrequencyMatchesRaw(
+                            skipped, detected.rawFrequencyHz);
+                    }),
+                detectedPeaks.end());
+        }
+        saveConfig();
+    }
+
+    void drawSkippedFrequencies() {
+        if (!ImGui::CollapsingHeader("Skipped Frequencies")) {
+            return;
+        }
+
+        const std::vector<SkippedFrequency> skippedSnapshot =
+            snapshotSkippedFrequencies();
+        if (skippedSnapshot.empty()) {
+            ImGui::TextDisabled("No skipped frequencies.");
+            return;
+        }
+
+        std::size_t restoreIndex = skippedSnapshot.size();
+        const ImGuiTableFlags flags =
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable(("##wsm_skipped_frequencies_" + name).c_str(),
+                              2, flags)) {
+            ImGui::TableSetupColumn("Frequency MHz");
+            ImGui::TableSetupColumn("Action");
+            ImGui::TableHeadersRow();
+            for (std::size_t index = 0; index < skippedSnapshot.size(); ++index) {
+                ImGui::PushID(static_cast<int>(index));
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%.6f", static_cast<double>(
+                                        skippedSnapshot[index].frequencyHz) /
+                                        1e6);
+                ImGui::TableSetColumnIndex(1);
+                if (ImGui::SmallButton("Restore")) {
+                    restoreIndex = index;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+
+        bool changed = false;
+        if (restoreIndex < skippedSnapshot.size()) {
+            std::lock_guard<std::mutex> lock(skippedFrequenciesMutex);
+            if (restoreIndex < skippedFrequencies.size()) {
+                skippedFrequencies.erase(skippedFrequencies.begin() +
+                                         restoreIndex);
+                changed = true;
+            }
+        }
+        if (ImGui::Button(
+                ("Clear All Skipped Frequencies##wsm_clear_skipped_" + name)
+                    .c_str(),
+                ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
+            std::lock_guard<std::mutex> lock(skippedFrequenciesMutex);
+            skippedFrequencies.clear();
+            changed = true;
+        }
+        if (changed) {
+            saveConfig();
+        }
     }
 
     static const char* splitterOutputRole(std::uintptr_t streamAddress,
@@ -4087,6 +4274,8 @@ private:
     double gainDisplayDb = 0.0;
 
     std::vector<SavedPeak> savedPeaks;
+    mutable std::mutex skippedFrequenciesMutex;
+    std::vector<SkippedFrequency> skippedFrequencies;
     DetectedPeak pendingPeak;
     std::array<char, 128> pendingPeakName{};
     bool openPeakPopup = false;
@@ -4190,6 +4379,7 @@ MOD_EXPORT void _INIT_() {
     defaults["customChannelStepKhz"] = 5.0;
     defaults["snapDetectedPeaks"] = true;
     defaults["savedPeaks"] = json::array();
+    defaults["skippedFrequencies"] = json::array();
 
     config.setPath(core::args["root"].s() + "/wide_spectrum_monitor_config.json");
     config.load(defaults);
