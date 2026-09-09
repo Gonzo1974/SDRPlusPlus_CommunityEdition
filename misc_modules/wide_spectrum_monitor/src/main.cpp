@@ -75,7 +75,27 @@ namespace {
         int tuningTimeMs = 120;
         int fftAveraging = 3;
         bool peakHold = true;
+        bool deepDiagnostics = false;
         double initialFrequencyHz = 0.0;
+    };
+
+    struct SweepProfile {
+        int tuningTimeMs = 120;
+        int fftAveraging = 3;
+        float overlapPercent = 10.0f;
+    };
+
+    struct SegmentPerformanceMetrics {
+        double tuneSettleMs = 0.0;
+        double iqCaptureMs = 0.0;
+        double fftComputeMs = 0.0;
+        double mergeMs = 0.0;
+        double diagnosticMs = 0.0;
+        double totalSegmentMs = 0.0;
+        double completeSweepSeconds = 0.0;
+        double segmentsPerSecond = 0.0;
+        double sweepsPerMinute = 0.0;
+        int currentSettlingMs = 0;
     };
 
     struct DetectedPeak {
@@ -440,6 +460,15 @@ namespace {
         CHANNEL_STEP_OPTION_COUNT
     };
 
+    enum SweepSpeedOption {
+        SWEEP_SPEED_QUALITY = 0,
+        SWEEP_SPEED_NORMAL,
+        SWEEP_SPEED_FAST,
+        SWEEP_SPEED_TURBO,
+        SWEEP_SPEED_CUSTOM,
+        SWEEP_SPEED_OPTION_COUNT
+    };
+
     const char* iqCaptureEndReasonText(IQCaptureEndReason reason) {
         switch (reason) {
         case IQCaptureEndReason::IN_PROGRESS:
@@ -638,10 +667,14 @@ public:
     explicit WideSpectrumMonitorModule(std::string instanceName) : name(std::move(instanceName)) {
         loadConfig();
         iqFrontendCurrentlyPlaying.store(gui::mainWindow.sdrIsRunning(), std::memory_order_relaxed);
-        sigpath::iqFrontEnd.setSplitterDiagnosticsEnabled(true);
+        sigpath::iqFrontEnd.setSplitterDiagnosticsEnabled(
+            deepDiagnosticsEnabled);
 
         if (initializeDirectFFT()) {
             iqCaptureBuffer.reserve(DIRECT_FFT_SIZE);
+            iqSamplesWork.reserve(DIRECT_FFT_SIZE);
+            segmentSpectrumWork.reserve(WIDE_BIN_COUNT);
+            segmentPeakSourcesWork.reserve(WIDE_BIN_COUNT);
         }
         else {
             statusText = "FFT initialization failed";
@@ -829,7 +862,9 @@ private:
         iqLastSinkInputAddress.store(0, std::memory_order_relaxed);
         iqLastBoundStreamAddress.store(0, std::memory_order_relaxed);
         iqFrontendCurrentlyPlaying.store(gui::mainWindow.sdrIsRunning(), std::memory_order_relaxed);
-        captureSplitterDiagnosticCheckpoint(beforePrivateBindCheckpoint);
+        if (deepDiagnosticsEnabled) {
+            captureSplitterDiagnosticCheckpoint(beforePrivateBindCheckpoint);
+        }
 
         try {
             iqStream = new dsp::stream<dsp::complex_t>();
@@ -840,7 +875,9 @@ private:
             sigpath::iqFrontEnd.bindIQStream(iqStream);
             iqStreamBound = true;
             iqLastPathBindCompleted.store(true, std::memory_order_relaxed);
-            captureSplitterDiagnosticCheckpoint(afterPrivateBindCheckpoint);
+            if (deepDiagnosticsEnabled) {
+                captureSplitterDiagnosticCheckpoint(afterPrivateBindCheckpoint);
+            }
 
             iqSink = new dsp::sink::Handler<dsp::complex_t>();
             iqLastSinkInputAddress.store(reinterpret_cast<std::uintptr_t>(iqStream), std::memory_order_relaxed);
@@ -922,6 +959,10 @@ private:
         fftAveraging = config.conf["fftAveraging"];
         thresholdDbfs = config.conf["thresholdDbfs"];
         peakHoldEnabled = config.conf["peakHold"];
+        sweepSpeedOption = config.conf.value(
+            "sweepSpeedOption", static_cast<int>(SWEEP_SPEED_QUALITY));
+        deepDiagnosticsEnabled =
+            config.conf.value("deepDiagnosticsEnabled", false);
         channelStepOption = config.conf.value("channelStepOption",
                                               static_cast<int>(CHANNEL_STEP_5_KHZ));
         customChannelStepKhz = config.conf.value("customChannelStepKhz", 5.0);
@@ -989,6 +1030,8 @@ private:
         config.conf["fftAveraging"] = fftAveraging;
         config.conf["thresholdDbfs"] = thresholdDbfs;
         config.conf["peakHold"] = peakHoldEnabled;
+        config.conf["sweepSpeedOption"] = sweepSpeedOption;
+        config.conf["deepDiagnosticsEnabled"] = deepDiagnosticsEnabled;
         config.conf["channelStepOption"] = channelStepOption;
         config.conf["customChannelStepKhz"] = customChannelStepKhz;
         config.conf["snapDetectedPeaks"] = snapDetectedPeaks;
@@ -1022,9 +1065,28 @@ private:
         tuningTimeMs = std::clamp(tuningTimeMs, 10, 2000);
         fftAveraging = std::clamp(fftAveraging, 1, 10);
         thresholdDbfs = std::clamp(thresholdDbfs, -150.0f, 0.0f);
+        sweepSpeedOption = std::clamp(
+            sweepSpeedOption, 0,
+            static_cast<int>(SWEEP_SPEED_OPTION_COUNT) - 1);
         channelStepOption = std::clamp(
             channelStepOption, 0, static_cast<int>(CHANNEL_STEP_OPTION_COUNT) - 1);
         customChannelStepKhz = std::clamp(customChannelStepKhz, 0.001, 1000.0);
+    }
+
+    SweepProfile selectedSweepProfile() const {
+        switch (sweepSpeedOption) {
+        case SWEEP_SPEED_NORMAL:
+            return { 75, 2, 10.0f };
+        case SWEEP_SPEED_FAST:
+            return { 40, 1, 5.0f };
+        case SWEEP_SPEED_TURBO:
+            return { 20, 1, 0.0f };
+        case SWEEP_SPEED_CUSTOM:
+            return { tuningTimeMs, fftAveraging, overlapPercent };
+        case SWEEP_SPEED_QUALITY:
+        default:
+            return { 120, 3, 10.0f };
+        }
     }
 
     double selectedChannelStepHz() const {
@@ -1217,6 +1279,31 @@ private:
             ImGui::EndDisabled();
         }
 
+        if (sweepActive || stopping) {
+            ImGui::BeginDisabled();
+        }
+        ImGui::TextUnformatted("Sweep Speed");
+        ImGui::SetNextItemWidth(-1.0f);
+        configChanged |= ImGui::Combo(
+            ("##wsm_sweep_speed_" + name).c_str(), &sweepSpeedOption,
+            "Quality\0Normal\0Fast\0Turbo\0Custom\0");
+        const SweepProfile selectedProfile = selectedSweepProfile();
+        ImGui::TextDisabled("%d ms | averaging %d | overlap %.1f%%",
+                            selectedProfile.tuningTimeMs,
+                            selectedProfile.fftAveraging,
+                            selectedProfile.overlapPercent);
+        const bool deepDiagnosticsChanged = ImGui::Checkbox(
+            ("Enable deep diagnostics##wsm_deep_diagnostics_" + name).c_str(),
+            &deepDiagnosticsEnabled);
+        configChanged |= deepDiagnosticsChanged;
+        if (deepDiagnosticsChanged) {
+            sigpath::iqFrontEnd.setSplitterDiagnosticsEnabled(
+                deepDiagnosticsEnabled);
+        }
+        if (sweepActive || stopping) {
+            ImGui::EndDisabled();
+        }
+
         ImGui::TextUnformatted("Channel Step");
         ImGui::SetNextItemWidth(-1.0f);
         operationalControlChanged |= ImGui::Combo(
@@ -1328,6 +1415,7 @@ private:
         }
 
         drawStatus();
+        drawPerformance();
         drawSpectrumGraph();
         drawPeakTable();
         drawPeakActionPopup();
@@ -1335,7 +1423,10 @@ private:
         drawSkippedFrequencies();
 
         if (ImGui::CollapsingHeader("Advanced Sweep Settings")) {
-            if (sweepActive || stopping) {
+            const bool customSettingsDisabled =
+                sweepActive || stopping ||
+                sweepSpeedOption != SWEEP_SPEED_CUSTOM;
+            if (customSettingsDisabled) {
                 ImGui::BeginDisabled();
             }
             ImGui::TextUnformatted("Sweep Overlap");
@@ -1356,12 +1447,22 @@ private:
                                 ("##wsm_average_" + name).c_str(), &fftAveraging,
                                 1, 10, "%d frames") ||
                             configChanged;
+            if (customSettingsDisabled) {
+                ImGui::EndDisabled();
+            }
+            if (sweepActive || stopping) {
+                ImGui::BeginDisabled();
+            }
             configChanged = ImGui::Checkbox(
                                 ("Peak Hold##wsm_peak_hold_" + name).c_str(),
                                 &peakHoldEnabled) ||
                             configChanged;
             if (sweepActive || stopping) {
                 ImGui::EndDisabled();
+            }
+            if (sweepSpeedOption != SWEEP_SPEED_CUSTOM) {
+                ImGui::TextDisabled(
+                    "Select Sweep Speed: Custom to edit these values.");
             }
             if (configChanged) {
                 sanitizeControls();
@@ -1409,13 +1510,15 @@ private:
         }
 
         SweepSettings settings;
+        const SweepProfile profile = selectedSweepProfile();
         settings.startHz = startFrequencyMHz * 1000000.0;
         settings.stopHz = stopFrequencyMHz * 1000000.0;
         settings.sampleRateHz = sampleRateHz;
-        settings.overlapPercent = overlapPercent;
-        settings.tuningTimeMs = tuningTimeMs;
-        settings.fftAveraging = fftAveraging;
+        settings.overlapPercent = profile.overlapPercent;
+        settings.tuningTimeMs = profile.tuningTimeMs;
+        settings.fftAveraging = profile.fftAveraging;
         settings.peakHold = peakHoldEnabled;
+        settings.deepDiagnostics = deepDiagnosticsEnabled;
         settings.initialFrequencyHz = gui::waterfall.getCenterFrequency();
         const auto selectedVfo =
             gui::waterfall.vfos.find(gui::waterfall.selectedVFO);
@@ -1445,11 +1548,14 @@ private:
                              : "Sweeping forward";
             activeSampleRateHz = sampleRateHz;
             activeUsableBandwidthHz = sampleRateHz * USABLE_BANDWIDTH_RATIO;
-            activeSegmentStepHz = activeUsableBandwidthHz * (1.0 - (overlapPercent / 100.0));
+            activeSegmentStepHz = activeUsableBandwidthHz *
+                                  (1.0 - (settings.overlapPercent / 100.0));
             currentSegment = 0;
             segmentCount = 0;
             currentSegmentDebugStats = {};
             currentArtifactDiagnostics = {};
+            currentPerformance = {};
+            currentPerformance.currentSettlingMs = settings.tuningTimeMs;
             activeSegmentBoundaries.clear();
         }
         sweepState.store(initialState, std::memory_order_release);
@@ -1617,16 +1723,27 @@ private:
         std::vector<WideBinPeakSource> cyclePeakSources;
         std::vector<bool> capturedSegments;
         SpectrumDebugStats cycleDebugStats;
+        std::vector<float> averagedFFT;
         std::size_t capturedSegmentCount = 0;
         auto sweepStartedAt = std::chrono::steady_clock::now();
         auto resetCycle = [&]() {
             cycleSpectrum.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            cycleReducers.mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            cycleReducers.percentile95.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            cycleReducers.percentile98.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            cycleReducers.top4Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            cycleReducers.top8Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
-            cycleReducers.contributors.assign(WIDE_BIN_COUNT, {});
+            if (settings.deepDiagnostics) {
+                cycleReducers.mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+                cycleReducers.percentile95.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+                cycleReducers.percentile98.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+                cycleReducers.top4Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+                cycleReducers.top8Mean.assign(WIDE_BIN_COUNT, NO_DATA_DBFS);
+                cycleReducers.contributors.assign(WIDE_BIN_COUNT, {});
+            }
+            else {
+                cycleReducers.mean.clear();
+                cycleReducers.percentile95.clear();
+                cycleReducers.percentile98.clear();
+                cycleReducers.top4Mean.clear();
+                cycleReducers.top8Mean.clear();
+                cycleReducers.contributors.clear();
+            }
             cycleQuality.assign(WIDE_BIN_COUNT, -1.0f);
             cyclePeakSources.assign(WIDE_BIN_COUNT, {});
             capturedSegments.assign(centers.size(), false);
@@ -1655,13 +1772,16 @@ private:
                                : static_cast<std::size_t>(
                                      std::distance(centers.begin(), firstAtOrHigher));
         }
-        bool firstTuneDiagnosticPending = true;
+        bool firstTuneDiagnosticPending = settings.deepDiagnostics;
 
         while (sweepRequested.load() && !shuttingDown.load()) {
             if (!waitForRunningState()) {
                 break;
             }
 
+            SegmentPerformanceMetrics performance;
+            performance.currentSettlingMs = settings.tuningTimeMs;
+            const auto segmentStartedAt = std::chrono::steady_clock::now();
             const double centerHz = centers[segmentIndex];
             {
                 std::lock_guard<std::mutex> lock(displayMutex);
@@ -1670,6 +1790,7 @@ private:
                 statusText = "Settling";
             }
 
+            const auto tuneStartedAt = std::chrono::steady_clock::now();
             if (firstTuneDiagnosticPending) {
                 captureSplitterDiagnosticCheckpoint(beforeFirstTuneCheckpoint, true);
             }
@@ -1688,14 +1809,19 @@ private:
                 captureSplitterDiagnosticCheckpoint(afterFirstTuneSettlingCheckpoint, true);
                 firstTuneDiagnosticPending = false;
             }
+            performance.tuneSettleMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tuneStartedAt)
+                    .count();
 
             SegmentDebugStats segmentDebugStats;
             segmentDebugStats.segmentNumber = static_cast<int>(segmentIndex) + 1;
-            std::vector<float> averagedFFT;
             SpectrumArtifactDiagnostics artifactDiagnostics;
             if (!captureAveragedFFT(settings.fftAveraging, settings.sampleRateHz,
-                                    centerHz, averagedFFT, cycleDebugStats,
-                                    segmentDebugStats, artifactDiagnostics)) {
+                                    centerHz, settings.deepDiagnostics,
+                                    averagedFFT, cycleDebugStats,
+                                    segmentDebugStats, artifactDiagnostics,
+                                    performance)) {
                 if (!sweepRequested.load() || shuttingDown.load()) {
                     break;
                 }
@@ -1703,10 +1829,15 @@ private:
                 return;
             }
 
+            const auto mergeStartedAt = std::chrono::steady_clock::now();
             segmentDebugStats.wideBinsWritten = mergeSegment(
                 settings, centerHz, averagedFFT, cycleSpectrum, cycleReducers,
                 cycleQuality, cyclePeakSources, segmentDebugStats,
-                artifactDiagnostics);
+                artifactDiagnostics, performance);
+            performance.mergeMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - mergeStartedAt)
+                    .count();
             if (!capturedSegments[segmentIndex]) {
                 capturedSegments[segmentIndex] = true;
                 ++capturedSegmentCount;
@@ -1722,10 +1853,22 @@ private:
                     static_cast<float>(segmentDebugStats.accumulatedUniqueWideBins) /
                     static_cast<float>(segmentDebugStats.wideBinsTotal);
             }
+            publishIncrementalSpectrum(settings, cycleSpectrum);
+            performance.totalSegmentMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - segmentStartedAt)
+                    .count();
+            performance.segmentsPerSecond =
+                performance.totalSegmentMs > 0.0
+                    ? 1000.0 / performance.totalSegmentMs
+                    : 0.0;
             {
                 std::lock_guard<std::mutex> lock(displayMutex);
                 currentSegmentDebugStats = segmentDebugStats;
                 currentArtifactDiagnostics = std::move(artifactDiagnostics);
+                performance.completeSweepSeconds = lastSweepSeconds;
+                performance.sweepsPerMinute = sweepsPerMinute;
+                currentPerformance = performance;
                 const SweepOperationalState state =
                     sweepState.load(std::memory_order_relaxed);
                 statusText = state == SweepOperationalState::RUNNING_REVERSE
@@ -1740,9 +1883,8 @@ private:
                                                 std::chrono::steady_clock::now() -
                                                 sweepStartedAt)
                                                 .count();
-                publishSweep(settings, std::move(cycleSpectrum),
-                             std::move(cyclePeakSources), sweepSeconds,
-                             cycleDebugStats);
+                publishSweep(settings, cycleSpectrum, cyclePeakSources,
+                             sweepSeconds, cycleDebugStats);
                 resetCycle();
             }
 
@@ -1756,6 +1898,19 @@ private:
                                                  : segmentIndex - 1;
             }
         }
+    }
+
+    void publishIncrementalSpectrum(const SweepSettings& settings,
+                                    const std::vector<float>& spectrum) {
+        std::lock_guard<std::mutex> lock(displayMutex);
+        displaySpectrum = spectrum;
+        displaySpectrumStartHz = settings.startHz;
+        displaySpectrumStopHz = settings.stopHz;
+        activeSampleRateHz = settings.sampleRateHz;
+        activeUsableBandwidthHz =
+            settings.sampleRateHz * USABLE_BANDWIDTH_RATIO;
+        activeSegmentStepHz = activeUsableBandwidthHz *
+                              (1.0 - (settings.overlapPercent / 100.0));
     }
 
     bool waitForRunningState() {
@@ -1879,6 +2034,7 @@ private:
     void computeSpectrumArtifactDiagnostics(
         const std::vector<float>& fft,
         const std::vector<std::vector<float>>& consistencyFrames,
+        std::size_t consistencyFrameCount,
         double sampleRateHz, double centerHz, int segmentNumber,
         SpectrumArtifactDiagnostics& diagnostics) const {
         diagnostics = {};
@@ -2046,12 +2202,12 @@ private:
             }
         }
 
-        diagnostics.consistencyFrameCount = consistencyFrames.size();
-        if (consistencyFrames.size() >= 2) {
+        diagnostics.consistencyFrameCount = consistencyFrameCount;
+        if (consistencyFrameCount >= 2) {
             diagnostics.frameOneToTwo = compareFFTFrames(
                 consistencyFrames[0], consistencyFrames[1]);
         }
-        if (consistencyFrames.size() >= 3) {
+        if (consistencyFrameCount >= 3) {
             diagnostics.frameTwoToThree = compareFFTFrames(
                 consistencyFrames[1], consistencyFrames[2]);
         }
@@ -2126,7 +2282,7 @@ private:
             iqCaptureTarget = 0;
             iqCaptureBuffer.clear();
             lock.unlock();
-            if (captureTimedOut) {
+            if (captureTimedOut && deepDiagnosticsEnabled) {
                 captureSplitterDiagnosticCheckpoint(captureTimeoutCheckpoint);
             }
             logIQCaptureFailure(snapshotIQCaptureDiagnostics());
@@ -2181,67 +2337,69 @@ private:
         return true;
     }
 
-    bool captureAveragedFFT(int requestedFrames, double sampleRateHz, double centerHz,
+    bool captureAveragedFFT(int requestedFrames, double sampleRateHz,
+                            double centerHz, bool deepDiagnostics,
                             std::vector<float>& averagedFFT,
                             SpectrumDebugStats& debugStats,
                             SegmentDebugStats& segmentDebugStats,
-                            SpectrumArtifactDiagnostics& artifactDiagnostics) {
-        const long long intervalSamples = std::llround(sampleRateHz / DIRECT_FFT_RATE);
+                            SpectrumArtifactDiagnostics& artifactDiagnostics,
+                            SegmentPerformanceMetrics& performance) {
+        const long long intervalSamples =
+            std::llround(sampleRateHz / DIRECT_FFT_RATE);
         const std::size_t iqSamplesPerFrame = static_cast<std::size_t>(
             std::clamp<long long>(intervalSamples, 2, DIRECT_FFT_SIZE));
         segmentDebugStats.iqSamplesPerFrame = iqSamplesPerFrame;
 
-        std::vector<double> sums(DIRECT_FFT_SIZE, 0.0);
-        std::vector<unsigned int> validCounts(DIRECT_FFT_SIZE, 0);
-        std::vector<unsigned char> sawZero(DIRECT_FFT_SIZE, 0);
-        std::vector<unsigned char> sawNonFinite(DIRECT_FFT_SIZE, 0);
-        std::vector<unsigned char> sawOutOfRange(DIRECT_FFT_SIZE, 0);
-        std::vector<std::vector<float>> consistencyFrames;
-        consistencyFrames.reserve(3);
-        std::vector<float> lastRawFFT;
+        std::size_t consistencyFrameCount = 0;
+        if (deepDiagnostics && diagnosticConsistencyFramesWork.size() != 3) {
+            diagnosticConsistencyFramesWork.resize(3);
+        }
 
-        for (int capturedFrames = 0; capturedFrames < requestedFrames; ++capturedFrames) {
-            std::vector<dsp::complex_t> iqSamples;
+        auto captureAndTransform = [&](std::vector<float>& fftData) {
             std::uint64_t generation = 0;
-            if (!captureIQFrame(iqSamplesPerFrame, sampleRateHz, iqSamples, generation)) {
+            const auto captureStartedAt = std::chrono::steady_clock::now();
+            const bool captured = captureIQFrame(
+                iqSamplesPerFrame, sampleRateHz, iqSamplesWork, generation);
+            performance.iqCaptureMs +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - captureStartedAt)
+                    .count();
+            if (!captured) {
                 return false;
             }
 
-            std::vector<float> fftData;
-            if (!computeDirectFFT(iqSamples, fftData) || fftData.size() != DIRECT_FFT_SIZE) {
+            const auto fftStartedAt = std::chrono::steady_clock::now();
+            const bool transformed = computeDirectFFT(iqSamplesWork, fftData) &&
+                                     fftData.size() == DIRECT_FFT_SIZE;
+            performance.fftComputeMs +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - fftStartedAt)
+                    .count();
+            if (!transformed) {
                 return false;
             }
-            if (consistencyFrames.size() < 3) {
-                consistencyFrames.push_back(fftData);
-            }
-            lastRawFFT = fftData;
 
             if (segmentDebugStats.firstIQFrameGeneration == 0) {
                 segmentDebugStats.firstIQFrameGeneration = generation;
             }
             segmentDebugStats.lastIQFrameGeneration = generation;
+            return true;
+        };
+
+        auto collectDeepFrameDiagnostics = [&](const std::vector<float>& fftData) {
+            const auto diagnosticStartedAt = std::chrono::steady_clock::now();
+            if (consistencyFrameCount < 3) {
+                diagnosticConsistencyFramesWork[consistencyFrameCount] = fftData;
+                ++consistencyFrameCount;
+            }
+            diagnosticLastRawFFTWork = fftData;
 
             RawFFTDistribution frameDistribution;
             frameDistribution.totalBins = fftData.size();
             for (std::size_t i = 0; i < fftData.size(); ++i) {
-                const float value = fftData[i];
-                recordRawFFTValue(value, i, fftData.size(), frameDistribution);
-                if (!std::isfinite(value)) {
-                    sawNonFinite[i] = 1;
-                }
-                else if (value > GRAPH_MAX_DB || value < MIN_VALID_FFT_DB) {
-                    sawOutOfRange[i] = 1;
-                }
-                else if (value == 0.0f) {
-                    sawZero[i] = 1;
-                }
-                if (!validateFFTDbfs(value, debugStats)) {
-                    continue;
-                }
-                sums[i] += value;
-                ++validCounts[i];
+                recordRawFFTValue(fftData[i], i, fftData.size(),
+                                  frameDistribution);
             }
-
             const std::size_t sampleIndices[RawFFTDistribution::SAMPLE_COUNT] = {
                 0,
                 1,
@@ -2253,31 +2411,117 @@ private:
                 fftData.size() - 2,
                 fftData.size() - 1
             };
-            for (std::size_t sample = 0; sample < RawFFTDistribution::SAMPLE_COUNT; ++sample) {
+            for (std::size_t sample = 0;
+                 sample < RawFFTDistribution::SAMPLE_COUNT; ++sample) {
                 frameDistribution.sampleIndices[sample] = sampleIndices[sample];
-                frameDistribution.sampleValues[sample] = fftData[sampleIndices[sample]];
+                frameDistribution.sampleValues[sample] =
+                    fftData[sampleIndices[sample]];
             }
             segmentDebugStats.rawDistribution = frameDistribution;
-        }
+            performance.diagnosticMs +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - diagnosticStartedAt)
+                    .count();
+        };
 
-        averagedFFT.resize(sums.size());
-        for (std::size_t i = 0; i < sums.size(); ++i) {
-            averagedFFT[i] = validCounts[i] > 0
-                                 ? static_cast<float>(sums[i] / static_cast<double>(validCounts[i]))
-                                 : NO_DATA_DBFS;
-            if (validCounts[i] > 0) {
+        // The common Fast/Turbo path needs no 65,536-element averaging arrays.
+        // Validate the single FFT in place and retain its exact bin layout.
+        if (requestedFrames == 1) {
+            if (!captureAndTransform(averagedFFT)) {
+                return false;
+            }
+            if (deepDiagnostics) {
+                collectDeepFrameDiagnostics(averagedFFT);
+            }
+            for (std::size_t i = 0; i < averagedFFT.size(); ++i) {
+                const float value = averagedFFT[i];
+                if (!validateFFTDbfs(value, debugStats)) {
+                    segmentDebugStats.rejectedZeroBins += value == 0.0f;
+                    segmentDebugStats.rejectedNonFiniteBins +=
+                        !std::isfinite(value);
+                    segmentDebugStats.rejectedOutOfRangeBins +=
+                        std::isfinite(value) && value != 0.0f &&
+                        (value > GRAPH_MAX_DB || value < MIN_VALID_FFT_DB);
+                    averagedFFT[i] = NO_DATA_DBFS;
+                    continue;
+                }
                 ++segmentDebugStats.validRawBins;
             }
-            else {
-                segmentDebugStats.rejectedZeroBins += sawZero[i] != 0;
-                segmentDebugStats.rejectedNonFiniteBins += sawNonFinite[i] != 0;
-                segmentDebugStats.rejectedOutOfRangeBins += sawOutOfRange[i] != 0;
-            }
+            segmentDebugStats.rawFftBinCount = averagedFFT.size();
         }
-        segmentDebugStats.rawFftBinCount = averagedFFT.size();
-        computeSpectrumArtifactDiagnostics(
-            lastRawFFT, consistencyFrames, sampleRateHz, centerHz,
-            segmentDebugStats.segmentNumber, artifactDiagnostics);
+        else {
+            averagingSumsWork.assign(DIRECT_FFT_SIZE, 0.0);
+            averagingValidCountsWork.assign(DIRECT_FFT_SIZE, 0);
+            if (deepDiagnostics) {
+                averagingSawZeroWork.assign(DIRECT_FFT_SIZE, 0);
+                averagingSawNonFiniteWork.assign(DIRECT_FFT_SIZE, 0);
+                averagingSawOutOfRangeWork.assign(DIRECT_FFT_SIZE, 0);
+            }
+
+            for (int capturedFrames = 0; capturedFrames < requestedFrames;
+                 ++capturedFrames) {
+                if (!captureAndTransform(fftFrameWork)) {
+                    return false;
+                }
+                if (deepDiagnostics) {
+                    collectDeepFrameDiagnostics(fftFrameWork);
+                }
+                for (std::size_t i = 0; i < fftFrameWork.size(); ++i) {
+                    const float value = fftFrameWork[i];
+                    if (deepDiagnostics) {
+                        if (!std::isfinite(value)) {
+                            averagingSawNonFiniteWork[i] = 1;
+                        }
+                        else if (value > GRAPH_MAX_DB ||
+                                 value < MIN_VALID_FFT_DB) {
+                            averagingSawOutOfRangeWork[i] = 1;
+                        }
+                        else if (value == 0.0f) {
+                            averagingSawZeroWork[i] = 1;
+                        }
+                    }
+                    if (!validateFFTDbfs(value, debugStats)) {
+                        continue;
+                    }
+                    averagingSumsWork[i] += value;
+                    ++averagingValidCountsWork[i];
+                }
+            }
+
+            averagedFFT.resize(DIRECT_FFT_SIZE);
+            for (std::size_t i = 0; i < averagedFFT.size(); ++i) {
+                averagedFFT[i] = averagingValidCountsWork[i] > 0
+                                     ? static_cast<float>(
+                                           averagingSumsWork[i] /
+                                           static_cast<double>(
+                                               averagingValidCountsWork[i]))
+                                     : NO_DATA_DBFS;
+                if (averagingValidCountsWork[i] > 0) {
+                    ++segmentDebugStats.validRawBins;
+                }
+                else if (deepDiagnostics) {
+                    segmentDebugStats.rejectedZeroBins +=
+                        averagingSawZeroWork[i] != 0;
+                    segmentDebugStats.rejectedNonFiniteBins +=
+                        averagingSawNonFiniteWork[i] != 0;
+                    segmentDebugStats.rejectedOutOfRangeBins +=
+                        averagingSawOutOfRangeWork[i] != 0;
+                }
+            }
+            segmentDebugStats.rawFftBinCount = averagedFFT.size();
+        }
+
+        if (deepDiagnostics) {
+            const auto diagnosticStartedAt = std::chrono::steady_clock::now();
+            computeSpectrumArtifactDiagnostics(
+                diagnosticLastRawFFTWork, diagnosticConsistencyFramesWork,
+                consistencyFrameCount, sampleRateHz, centerHz,
+                segmentDebugStats.segmentNumber, artifactDiagnostics);
+            performance.diagnosticMs +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - diagnosticStartedAt)
+                    .count();
+        }
         return true;
     }
 
@@ -2570,15 +2814,17 @@ private:
                              std::vector<float>& quality,
                              std::vector<WideBinPeakSource>& peakSources,
                              SegmentDebugStats& segmentDebugStats,
-                             SpectrumArtifactDiagnostics& artifactDiagnostics) const {
+                             SpectrumArtifactDiagnostics& artifactDiagnostics,
+                             SegmentPerformanceMetrics& performance) {
         if (fft.size() < 2 || output.empty() || output.size() != quality.size() ||
             peakSources.size() != output.size() ||
-            diagnosticReducers.mean.size() != output.size() ||
-            diagnosticReducers.percentile95.size() != output.size() ||
-            diagnosticReducers.percentile98.size() != output.size() ||
-            diagnosticReducers.top4Mean.size() != output.size() ||
-            diagnosticReducers.top8Mean.size() != output.size() ||
-            diagnosticReducers.contributors.size() != output.size()) {
+            (settings.deepDiagnostics &&
+             (diagnosticReducers.mean.size() != output.size() ||
+              diagnosticReducers.percentile95.size() != output.size() ||
+              diagnosticReducers.percentile98.size() != output.size() ||
+              diagnosticReducers.top4Mean.size() != output.size() ||
+              diagnosticReducers.top8Mean.size() != output.size() ||
+              diagnosticReducers.contributors.size() != output.size()))) {
             return 0;
         }
 
@@ -2599,6 +2845,72 @@ private:
         segmentDebugStats.usableStartHz = effectiveUsableStartHz;
         segmentDebugStats.usableStopHz = effectiveUsableStopHz;
 
+        if (!settings.deepDiagnostics) {
+            segmentSpectrumWork.assign(output.size(), NO_DATA_DBFS);
+            segmentPeakSourcesWork.assign(output.size(), {});
+            for (std::size_t rawIndex = 0; rawIndex < fft.size(); ++rawIndex) {
+                const float candidate = fft[rawIndex];
+                if (!isValidDbfs(candidate)) {
+                    continue;
+                }
+
+                const double frequencyHz =
+                    rawStartHz +
+                    ((static_cast<double>(rawIndex) + 0.5) * rawBinWidthHz);
+                if (frequencyHz < effectiveUsableStartHz ||
+                    frequencyHz >= effectiveUsableStopHz) {
+                    continue;
+                }
+                const double widePosition =
+                    (frequencyHz - settings.startHz) / wideBinWidthHz;
+                if (widePosition < 0.0 ||
+                    widePosition >= static_cast<double>(output.size())) {
+                    continue;
+                }
+
+                const std::size_t wideIndex =
+                    static_cast<std::size_t>(std::floor(widePosition));
+                float& segmentLevel = segmentSpectrumWork[wideIndex];
+                if (!std::isfinite(segmentLevel) || candidate > segmentLevel) {
+                    segmentLevel = candidate;
+                    WideBinPeakSource& peakSource =
+                        segmentPeakSourcesWork[wideIndex];
+                    peakSource.valid = true;
+                    peakSource.rawFftBinIndex = rawIndex;
+                    peakSource.segmentCenterHz = centerHz;
+                    peakSource.sampleRateHz = settings.sampleRateHz;
+                    peakSource.rawFftSize = fft.size();
+                    peakSource.rawFrequencyHz =
+                        rawStartHz +
+                        (static_cast<double>(rawIndex) * rawBinWidthHz);
+                }
+            }
+
+            std::size_t writtenBins = 0;
+            for (std::size_t wideIndex = 0; wideIndex < output.size();
+                 ++wideIndex) {
+                const float level = segmentSpectrumWork[wideIndex];
+                if (!isValidDbfs(level)) {
+                    continue;
+                }
+                const double frequencyHz =
+                    settings.startHz +
+                    ((static_cast<double>(wideIndex) + 0.5) * wideBinWidthHz);
+                const float segmentQuality = static_cast<float>(
+                    1.0 - (std::abs(frequencyHz - centerHz) / usableHalf));
+                if (segmentQuality <= quality[wideIndex]) {
+                    continue;
+                }
+                output[wideIndex] = level;
+                peakSources[wideIndex] = segmentPeakSourcesWork[wideIndex];
+                quality[wideIndex] = segmentQuality;
+                ++writtenBins;
+            }
+            return writtenBins;
+        }
+
+        const auto diagnosticStartedAt = std::chrono::steady_clock::now();
+
         SegmentContributionDiagnostics contribution;
         contribution.centerHz = centerHz;
         contribution.rawStartHz = rawStartHz;
@@ -2609,13 +2921,24 @@ private:
         // Project every valid raw FFT bin exactly once. A wide bin is much wider
         // than a raw bin, so every raw bin landing in it participates in the max
         // reduction instead of relying on rounded, output-driven index ranges.
-        std::vector<float> segmentSpectrum(output.size(), NO_DATA_DBFS);
-        std::vector<double> segmentSums(output.size(), 0.0);
-        std::vector<std::size_t> segmentCounts(output.size(), 0);
-        std::vector<float> segmentHighest(output.size(), NO_DATA_DBFS);
-        std::vector<float> segmentSecondHighest(output.size(), NO_DATA_DBFS);
-        std::vector<WideBinPeakSource> segmentPeakSources(output.size());
-        std::vector<std::vector<float>> segmentValues(output.size());
+        segmentSpectrumWork.assign(output.size(), NO_DATA_DBFS);
+        segmentSumsWork.assign(output.size(), 0.0);
+        segmentCountsWork.assign(output.size(), 0);
+        segmentHighestWork.assign(output.size(), NO_DATA_DBFS);
+        segmentSecondHighestWork.assign(output.size(), NO_DATA_DBFS);
+        segmentPeakSourcesWork.assign(output.size(), {});
+        segmentValuesWork.resize(output.size());
+        for (std::vector<float>& values : segmentValuesWork) {
+            values.clear();
+        }
+        std::vector<float>& segmentSpectrum = segmentSpectrumWork;
+        std::vector<double>& segmentSums = segmentSumsWork;
+        std::vector<std::size_t>& segmentCounts = segmentCountsWork;
+        std::vector<float>& segmentHighest = segmentHighestWork;
+        std::vector<float>& segmentSecondHighest = segmentSecondHighestWork;
+        std::vector<WideBinPeakSource>& segmentPeakSources =
+            segmentPeakSourcesWork;
+        std::vector<std::vector<float>>& segmentValues = segmentValuesWork;
         const std::size_t expectedRawBinsPerWideBin = std::max<std::size_t>(
             8, static_cast<std::size_t>(std::ceil(wideBinWidthHz / rawBinWidthHz)) + 2);
         for (std::size_t rawIndex = 0; rawIndex < fft.size(); ++rawIndex) {
@@ -2671,8 +2994,9 @@ private:
             }
         }
 
-        std::vector<std::size_t> hitWideBins;
-        hitWideBins.reserve(output.size());
+        hitWideBinsWork.clear();
+        hitWideBinsWork.reserve(output.size());
+        std::vector<std::size_t>& hitWideBins = hitWideBinsWork;
         std::size_t rawBinsAcrossHitWideBins = 0;
         contribution.minimumRawBinsPerWideBin = std::numeric_limits<std::size_t>::max();
         for (std::size_t wideIndex = 0; wideIndex < output.size(); ++wideIndex) {
@@ -2698,7 +3022,9 @@ private:
             contribution.minimumRawBinsPerWideBin = 0;
         }
 
-        std::vector<WideBinReducerContributor> segmentContributors(output.size());
+        segmentContributorsWork.assign(output.size(), {});
+        std::vector<WideBinReducerContributor>& segmentContributors =
+            segmentContributorsWork;
         for (std::size_t wideIndex : hitWideBins) {
             std::vector<float>& values = segmentValues[wideIndex];
             const std::size_t count = values.size();
@@ -2834,11 +3160,16 @@ private:
         computeRobustReducerDiagnostics(
             settings, output, diagnosticReducers,
             artifactDiagnostics.robustReducers);
+        performance.diagnosticMs +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - diagnosticStartedAt)
+                .count();
         return writtenBins;
     }
 
-    void publishSweep(const SweepSettings& settings, std::vector<float> spectrum,
-                      std::vector<WideBinPeakSource> peakSources,
+    void publishSweep(const SweepSettings& settings,
+                      const std::vector<float>& spectrum,
+                      const std::vector<WideBinPeakSource>& peakSources,
                       double sweepSeconds, SpectrumDebugStats debugStats) {
         debugStats.totalWideBins = spectrum.size();
         for (float level : spectrum) {
@@ -2882,17 +3213,22 @@ private:
         const bool rangeChanged = !completedSweepValid ||
                                   std::abs(displayedStartHz - settings.startHz) > 1.0 ||
                                   std::abs(displayedStopHz - settings.stopHz) > 1.0;
-        completedSweep = std::move(spectrum);
+        displaySpectrum = spectrum;
+        completedSweep = spectrum;
         detectedPeaks = std::move(peaks);
         lastError.clear();
         displayedStartHz = settings.startHz;
         displayedStopHz = settings.stopHz;
+        displaySpectrumStartHz = settings.startHz;
+        displaySpectrumStopHz = settings.stopHz;
         activeSampleRateHz = settings.sampleRateHz;
         activeUsableBandwidthHz = settings.sampleRateHz * USABLE_BANDWIDTH_RATIO;
         activeSegmentStepHz = activeUsableBandwidthHz * (1.0 - (settings.overlapPercent / 100.0));
         completedSweepValid = true;
         lastSweepSeconds = sweepSeconds;
         sweepsPerMinute = (sweepSeconds > 0.0) ? (60.0 / sweepSeconds) : 0.0;
+        currentPerformance.completeSweepSeconds = sweepSeconds;
+        currentPerformance.sweepsPerMinute = sweepsPerMinute;
         ++completedSweeps;
         const SweepOperationalState state =
             sweepState.load(std::memory_order_relaxed);
@@ -3032,6 +3368,32 @@ private:
         }
     }
 
+    void drawPerformance() {
+        SegmentPerformanceMetrics performance;
+        {
+            std::lock_guard<std::mutex> lock(displayMutex);
+            performance = currentPerformance;
+        }
+        if (!ImGui::CollapsingHeader("Performance",
+                                     ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+        ImGui::Text("Current settling: %d ms",
+                    performance.currentSettlingMs);
+        ImGui::Text("Tune/settle: %.2f ms", performance.tuneSettleMs);
+        ImGui::Text("IQ capture: %.2f ms", performance.iqCaptureMs);
+        ImGui::Text("FFT compute: %.2f ms", performance.fftComputeMs);
+        ImGui::Text("Merge: %.2f ms", performance.mergeMs);
+        ImGui::Text("Diagnostic: %.2f ms", performance.diagnosticMs);
+        ImGui::Text("Total segment: %.2f ms", performance.totalSegmentMs);
+        ImGui::Text("Segments/sec: %.2f", performance.segmentsPerSecond);
+        ImGui::Text("Complete sweep: %.3f s",
+                    performance.completeSweepSeconds);
+        ImGui::Text("Sweeps/min: %.2f", performance.sweepsPerMinute);
+        ImGui::TextDisabled(
+            "Diagnostic time is included in capture/merge totals.");
+    }
+
     void drawSpectrumGraph() {
         std::vector<float> spectrum;
         std::vector<float> heldPeaks;
@@ -3040,12 +3402,12 @@ private:
         double stopHz = stopFrequencyMHz * 1e6;
         {
             std::lock_guard<std::mutex> lock(displayMutex);
-            spectrum = completedSweep;
+            spectrum = displaySpectrum;
             heldPeaks = peakSpectrum;
             segmentBoundaries = activeSegmentBoundaries;
-            if (displayedStopHz > displayedStartHz) {
-                startHz = displayedStartHz;
-                stopHz = displayedStopHz;
+            if (displaySpectrumStopHz > displaySpectrumStartHz) {
+                startHz = displaySpectrumStartHz;
+                stopHz = displaySpectrumStopHz;
             }
         }
 
@@ -4060,7 +4422,7 @@ private:
         SplitterDiagnosticCheckpoint immediatelyAfterFirstTune;
         SplitterDiagnosticCheckpoint afterFirstTuneSettling;
         SplitterDiagnosticCheckpoint captureTimeout;
-        {
+        if (deepDiagnosticsEnabled) {
             std::lock_guard<std::mutex> lock(splitterCheckpointMutex);
             beforePrivateBind = beforePrivateBindCheckpoint;
             afterPrivateBind = afterPrivateBindCheckpoint;
@@ -4080,6 +4442,8 @@ private:
         ImGui::Text("Sample rate: %.3f MS/s", sampleRateHz / 1e6);
         ImGui::Text("Usable bandwidth: %.3f MHz", usableBandwidthHz / 1e6);
         ImGui::Text("Segment center step: %.3f MHz", segmentStepHz / 1e6);
+        ImGui::Text("Deep diagnostics: %s",
+                    deepDiagnosticsEnabled ? "enabled" : "disabled");
         ImGui::Separator();
         ImGui::TextUnformatted("V10 IQ capture lifecycle");
         ImGui::Text("Capture path creation attempts: %llu", static_cast<unsigned long long>(iqDiagnostics.pathCreationAttempts));
@@ -4102,28 +4466,40 @@ private:
         ImGui::Text("IQ frame generation at attempt end: %llu", static_cast<unsigned long long>(iqDiagnostics.generation));
         ImGui::Separator();
         ImGui::TextUnformatted("V11 IQFrontend splitter blocking diagnostic");
-        ImGui::Text("Known fftIn stream pointer: 0x%llX",
-                    static_cast<unsigned long long>(fftInputAddress));
-        ImGui::Text("Known WSM stream pointer: 0x%llX",
-                    static_cast<unsigned long long>(iqDiagnostics.privateStreamAddress));
-        drawSplitterDiagnosticCheckpoint("Before private bind", beforePrivateBind,
-                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
-        drawSplitterDiagnosticCheckpoint("After private bind", afterPrivateBind,
-                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
-        drawSplitterDiagnosticCheckpoint("Before first sweep tune", beforeFirstTune,
-                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
-        drawSplitterDiagnosticCheckpoint("Immediately after first sweep tune",
-                                         immediatelyAfterFirstTune, fftInputAddress,
-                                         iqDiagnostics.privateStreamAddress);
-        drawSplitterDiagnosticCheckpoint("After first sweep tune settling",
-                                         afterFirstTuneSettling, fftInputAddress,
-                                         iqDiagnostics.privateStreamAddress);
-        drawSplitterDiagnosticCheckpoint("At capture timeout", captureTimeout,
-                                         fftInputAddress, iqDiagnostics.privateStreamAddress);
-        ImGui::Separator();
-        drawSpectrumArtifactDiagnostics(artifactDiagnostics);
-        ImGui::Separator();
-        drawRobustReducerDiagnostics(artifactDiagnostics.robustReducers);
+        if (deepDiagnosticsEnabled) {
+            ImGui::Text("Known fftIn stream pointer: 0x%llX",
+                        static_cast<unsigned long long>(fftInputAddress));
+            ImGui::Text("Known WSM stream pointer: 0x%llX",
+                        static_cast<unsigned long long>(iqDiagnostics.privateStreamAddress));
+            drawSplitterDiagnosticCheckpoint("Before private bind", beforePrivateBind,
+                                             fftInputAddress, iqDiagnostics.privateStreamAddress);
+            drawSplitterDiagnosticCheckpoint("After private bind", afterPrivateBind,
+                                             fftInputAddress, iqDiagnostics.privateStreamAddress);
+            drawSplitterDiagnosticCheckpoint("Before first sweep tune", beforeFirstTune,
+                                             fftInputAddress, iqDiagnostics.privateStreamAddress);
+            drawSplitterDiagnosticCheckpoint("Immediately after first sweep tune",
+                                             immediatelyAfterFirstTune, fftInputAddress,
+                                             iqDiagnostics.privateStreamAddress);
+            drawSplitterDiagnosticCheckpoint("After first sweep tune settling",
+                                             afterFirstTuneSettling, fftInputAddress,
+                                             iqDiagnostics.privateStreamAddress);
+            drawSplitterDiagnosticCheckpoint("At capture timeout", captureTimeout,
+                                             fftInputAddress, iqDiagnostics.privateStreamAddress);
+        }
+        else {
+            ImGui::TextDisabled("Splitter checkpoints are disabled.");
+        }
+        if (deepDiagnosticsEnabled) {
+            ImGui::Separator();
+            drawSpectrumArtifactDiagnostics(artifactDiagnostics);
+            ImGui::Separator();
+            drawRobustReducerDiagnostics(artifactDiagnostics.robustReducers);
+        }
+        else {
+            ImGui::Separator();
+            ImGui::TextDisabled(
+                "V12/V13 analysis is skipped; enable deep diagnostics before starting.");
+        }
         ImGui::Separator();
         ImGui::TextUnformatted("FFT source: private IQFrontEnd stream (V10 lifecycle)");
         ImGui::Text("Current segment data: %d / %d", segmentDebugStats.segmentNumber, totalSegments);
@@ -4144,7 +4520,9 @@ private:
                     segmentDebugStats.rawStartHz / 1e6, segmentDebugStats.rawStopHz / 1e6);
         ImGui::Text("Effective usable start/end: %.6f / %.6f MHz",
                     segmentDebugStats.usableStartHz / 1e6, segmentDebugStats.usableStopHz / 1e6);
-        drawRawFFTDistribution(segmentDebugStats.rawDistribution);
+        if (deepDiagnosticsEnabled) {
+            drawRawFFTDistribution(segmentDebugStats.rawDistribution);
+        }
         ImGui::Separator();
         ImGui::Text("FFT values: direct VOLK logarithmic power (no additional conversion)");
         drawDebugRange("FFT raw min/max", debugStats.rawMin, debugStats.rawMax);
@@ -4258,6 +4636,8 @@ private:
     int fftAveraging = 3;
     float thresholdDbfs = -55.0f;
     bool peakHoldEnabled = true;
+    int sweepSpeedOption = SWEEP_SPEED_QUALITY;
+    bool deepDiagnosticsEnabled = false;
     int channelStepOption = CHANNEL_STEP_5_KHZ;
     double customChannelStepKhz = 5.0;
     bool snapDetectedPeaks = true;
@@ -4334,8 +4714,27 @@ private:
     fftwf_complex* directFFTOut = nullptr;
     fftwf_plan directFFTPlan = nullptr;
     std::vector<float> directFFTWindow;
+    std::vector<dsp::complex_t> iqSamplesWork;
+    std::vector<float> fftFrameWork;
+    std::vector<double> averagingSumsWork;
+    std::vector<unsigned int> averagingValidCountsWork;
+    std::vector<unsigned char> averagingSawZeroWork;
+    std::vector<unsigned char> averagingSawNonFiniteWork;
+    std::vector<unsigned char> averagingSawOutOfRangeWork;
+    std::vector<float> diagnosticLastRawFFTWork;
+    std::vector<std::vector<float>> diagnosticConsistencyFramesWork;
+    std::vector<float> segmentSpectrumWork;
+    std::vector<double> segmentSumsWork;
+    std::vector<std::size_t> segmentCountsWork;
+    std::vector<float> segmentHighestWork;
+    std::vector<float> segmentSecondHighestWork;
+    std::vector<WideBinPeakSource> segmentPeakSourcesWork;
+    std::vector<std::vector<float>> segmentValuesWork;
+    std::vector<std::size_t> hitWideBinsWork;
+    std::vector<WideBinReducerContributor> segmentContributorsWork;
 
     std::mutex displayMutex;
+    std::vector<float> displaySpectrum;
     std::vector<float> completedSweep;
     std::vector<float> peakSpectrum;
     std::vector<DetectedPeak> detectedPeaks;
@@ -4343,6 +4742,8 @@ private:
     std::string lastError;
     double displayedStartHz = 0.0;
     double displayedStopHz = 0.0;
+    double displaySpectrumStartHz = 0.0;
+    double displaySpectrumStopHz = 0.0;
     double activeSampleRateHz = 0.0;
     double activeUsableBandwidthHz = 0.0;
     double activeSegmentStepHz = 0.0;
@@ -4356,6 +4757,7 @@ private:
     SpectrumDebugStats lastDebugStats;
     SegmentDebugStats currentSegmentDebugStats;
     SpectrumArtifactDiagnostics currentArtifactDiagnostics;
+    SegmentPerformanceMetrics currentPerformance;
     std::vector<SegmentBoundaryDiagnostic> activeSegmentBoundaries;
     int v13ComparisonReducer = V13_REDUCER_P98;
     double v13ReferenceFrequencyMHz = 0.0;
@@ -4375,6 +4777,8 @@ MOD_EXPORT void _INIT_() {
     defaults["fftAveraging"] = 3;
     defaults["thresholdDbfs"] = -55.0;
     defaults["peakHold"] = true;
+    defaults["sweepSpeedOption"] = static_cast<int>(SWEEP_SPEED_QUALITY);
+    defaults["deepDiagnosticsEnabled"] = false;
     defaults["channelStepOption"] = static_cast<int>(CHANNEL_STEP_5_KHZ);
     defaults["customChannelStepKhz"] = 5.0;
     defaults["snapDetectedPeaks"] = true;
