@@ -914,6 +914,27 @@ private:
         config.release();
     }
 
+    void createImportTargetList() {
+        std::string listName = "Imported";
+        int suffix = 2;
+
+        config.acquire();
+        while (config.conf["lists"].contains(listName)) {
+            listName = "Imported (" + std::to_string(suffix++) + ")";
+        }
+        config.conf["lists"][listName]["showOnWaterfall"] = true;
+        config.conf["lists"][listName]["bookmarks"] = json::object();
+        config.conf["selectedList"] = listName;
+        config.release(true);
+
+        selectedListName = listName;
+        refreshLists();
+        selectedListId = std::distance(listNames.begin(), std::find(listNames.begin(), listNames.end(), listName));
+#ifdef __ANDROID__
+        flog::info("SDRPP_ANDROID15: created import target list='{0}'", listName);
+#endif
+    }
+
     void refreshWaterfallBookmarks(bool lockConfig = true) {
         if (lockConfig) { config.acquire(); }
         waterfallBookmarks.clear();
@@ -1317,14 +1338,27 @@ private:
         if (selectedNames.size() != 1 && _this->selectedListName != "") { style::endDisabled(); }
 
         //Draw import and export buttons
+        bool importWithoutSelectedList = _this->selectedListName.empty();
+        if (importWithoutSelectedList) { style::endDisabled(); }
         ImGui::BeginTable(("freq_manager_bottom_btn_table" + _this->name).c_str(), 2);
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        if (ImGui::Button(("Import##_freq_mgr_imp_" + _this->name).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0)) && !_this->importOpen) {
+        bool importActivated = ImGui::Button(("Import##_freq_mgr_imp_" + _this->name).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0));
 #ifdef __ANDROID__
+        if (ImGui::IsItemActivated()) {
+            backend::setAndroidCompatibilityControl("Frequency Manager Import button");
+            flog::info("SDRPP_ANDROID15: Frequency Manager Import ImGui item activated");
+        }
+#endif
+        if (importActivated && !_this->importOpen) {
+#ifdef __ANDROID__
+            backend::setAndroidDocumentPickerDiagnostic("native picker request", 0, "");
+            flog::info("SDRPP_ANDROID15: Frequency Manager requesting Android document picker");
             _this->importOpen = backend::openDocumentPicker();
             if (!_this->importOpen) {
+                backend::setAndroidDocumentPickerDiagnostic("picker start failed", 0,
+                    "Could not start the Android document picker");
                 _this->showImportMessage("Import failed.\n\nCould not start the Android document picker.");
             }
 #else
@@ -1332,6 +1366,7 @@ private:
             _this->importDialog = new pfd::open_file("Import bookmarks", "", { "JSON Files (*.json)", "*.json", "All Files", "*" }, pfd::opt::multiselect);
 #endif
         }
+        if (importWithoutSelectedList) { style::beginDisabled(); }
 
         ImGui::TableSetColumnIndex(1);
         if (selectedNames.size() == 0 && _this->selectedListName != "") { style::beginDisabled(); }
@@ -1393,9 +1428,15 @@ private:
         if (_this->importOpen) {
             backend::AndroidDocumentPickerStatus status = backend::getDocumentPickerStatus();
             if (status == backend::AndroidDocumentPickerStatus::SELECTED) {
+                std::uint64_t importedBytes = backend::getDocumentPickerImportedBytes();
                 std::string path = backend::consumeDocumentPickerResult();
                 _this->importOpen = false;
+                flog::info("SDRPP_ANDROID15: Frequency Manager received native path='{0}' copied_bytes={1}",
+                    path, importedBytes);
+                backend::setAndroidDocumentPickerDiagnostic("native path received", importedBytes, "");
                 if (path.empty()) {
+                    backend::setAndroidDocumentPickerDiagnostic("empty native path", importedBytes,
+                        "The Android document picker returned an empty file path");
                     _this->showImportMessage("Import failed.\n\nThe Android document picker returned an empty file path.");
                 }
                 else {
@@ -1408,12 +1449,21 @@ private:
                         flog::error("Frequency Manager: Unexpected import error: {}", e.what());
                     }
                     std::remove(path.c_str());
+                    if (result.success) {
+                        backend::setAndroidDocumentPickerDiagnostic(
+                            "import completed: " + std::to_string(result.imported) + " bookmark(s)",
+                            importedBytes, "");
+                    }
+                    else {
+                        backend::setAndroidDocumentPickerDiagnostic("parser error", importedBytes, result.error);
+                    }
                     _this->showImportResult(result);
                 }
             }
             else if (status == backend::AndroidDocumentPickerStatus::CANCELLED) {
                 backend::consumeDocumentPickerResult();
                 _this->importOpen = false;
+                backend::setAndroidDocumentPickerDiagnostic("cancelled", 0, "");
             }
             else if (status == backend::AndroidDocumentPickerStatus::ERROR) {
                 std::string error = backend::consumeDocumentPickerResult();
@@ -1421,6 +1471,7 @@ private:
                 if (error.empty()) {
                     error = "Could not communicate with the Android document picker.";
                 }
+                backend::setAndroidDocumentPickerDiagnostic("picker error", 0, error);
                 _this->showImportMessage("Import failed.\n\n" + error);
             }
         }
@@ -1639,12 +1690,22 @@ private:
 
     ImportResult importBookmarks(const std::string& path) {
         ImportResult result;
+#ifdef __ANDROID__
+        flog::info("SDRPP_ANDROID15: parser opening import path='{0}'", path);
+#endif
         std::ifstream fs(path);
         if (!fs.is_open()) {
             result.error = "The selected file could not be opened.";
             flog::error("Frequency Manager: Could not open import file '{}'", path);
+#ifdef __ANDROID__
+            backend::setAndroidDocumentPickerDiagnostic("file open failed",
+                backend::getDocumentPickerImportedBytes(), result.error);
+#endif
             return result;
         }
+#ifdef __ANDROID__
+        flog::info("SDRPP_ANDROID15: parser opened cached import file successfully");
+#endif
 
         json importedData;
         try {
@@ -1653,8 +1714,15 @@ private:
         catch (const std::exception& e) {
             result.error = std::string("The selected file is not valid JSON: ") + e.what();
             flog::error("Frequency Manager: Could not parse import file '{}': {}", path, e.what());
+#ifdef __ANDROID__
+            backend::setAndroidDocumentPickerDiagnostic("JSON parse failed",
+                backend::getDocumentPickerImportedBytes(), result.error);
+#endif
             return result;
         }
+#ifdef __ANDROID__
+        flog::info("SDRPP_ANDROID15: JSON parse succeeded top_level_type={0}", importedData.type_name());
+#endif
 
         if (!importedData.is_object() || !importedData.contains("bookmarks")) {
             result.error = "The selected file does not contain a 'bookmarks' object.";
@@ -1667,6 +1735,10 @@ private:
             flog::error("Frequency Manager: Import file has an invalid bookmarks value");
             return result;
         }
+
+        // A deleted final list can leave its entries in the transient UI map. They
+        // must not be treated as duplicates when import creates a replacement list.
+        if (selectedListName.empty()) { bookmarks.clear(); }
 
         // Load every bookmark using efficient deserialization
         for (auto const& item : importedData["bookmarks"].items()) {
@@ -1716,10 +1788,15 @@ private:
         }
 
         if (result.imported > 0) {
+            if (selectedListName.empty()) { createImportTargetList(); }
             saveByName(selectedListName);
             markScanListDirty();  // PERFORMANCE: Immediate scanner update
         }
         result.success = true;
+#ifdef __ANDROID__
+        flog::info("SDRPP_ANDROID15: import result imported={0} duplicates={1} invalid={2}",
+            result.imported, result.duplicates, result.invalid);
+#endif
         return result;
     }
 

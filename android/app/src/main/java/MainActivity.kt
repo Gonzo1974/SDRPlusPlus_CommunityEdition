@@ -11,6 +11,7 @@ import android.content.DialogInterface;
 import android.content.pm.PackageManager;
 import android.hardware.usb.*;
 import android.Manifest;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
 import android.view.KeyEvent;
@@ -70,6 +71,7 @@ class MainActivity : NativeActivity() {
     private val documentPickerLock = Any();
     private var documentPickerStatus : Int = DOCUMENT_PICKER_IDLE;
     private var documentPickerResult : String = "";
+    @Volatile private var documentPickerImportedBytes : Long = 0;
 
     fun checkAndAsk(permission: String) {
         if (PermissionChecker.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
@@ -109,20 +111,64 @@ class MainActivity : NativeActivity() {
         checkAndAsk(Manifest.permission.INTERNET);
 
         super.onCreate(savedInstanceState)
+        window.decorView.post {
+            logAndroidCompatibility("startup");
+        }
     }
 
     public override fun onResume() {
         // Hide bars again
         hideSystemBars();
         super.onResume();
+        window.decorView.post {
+            logAndroidCompatibility("resume");
+        }
     }
+
+    private fun currentInsets(): IntArray {
+        val insets = window.decorView.rootWindowInsets;
+        return if (insets != null) {
+            intArrayOf(insets.stableInsetLeft, insets.stableInsetTop,
+                insets.stableInsetRight, insets.stableInsetBottom);
+        }
+        else {
+            intArrayOf(0, 0, 0, 0);
+        }
+    }
+
+    private fun logAndroidCompatibility(stage: String) {
+        val metrics = resources.displayMetrics;
+        val insets = currentInsets();
+        Log.i(TAG, "SDRPP_ANDROID15: " + stage +
+            " api=" + Build.VERSION.SDK_INT +
+            " release=" + Build.VERSION.RELEASE +
+            " targetSdk=" + applicationInfo.targetSdkVersion +
+            " display=" + metrics.widthPixels + "x" + metrics.heightPixels +
+            " decor=" + window.decorView.width + "x" + window.decorView.height +
+            " density=" + metrics.density +
+            " insets=" + insets[0] + "," + insets[1] + "," + insets[2] + "," + insets[3] +
+            " audioBackend=AAudio(native)");
+    }
+
+    fun getAndroidSdkInt(): Int = Build.VERSION.SDK_INT;
+    fun getTargetSdkVersionValue(): Int = applicationInfo.targetSdkVersion;
+    fun getAndroidReleaseValue(): String = Build.VERSION.RELEASE ?: "unknown";
+    fun getDisplayWidthValue(): Int = resources.displayMetrics.widthPixels;
+    fun getDisplayHeightValue(): Int = resources.displayMetrics.heightPixels;
+    fun getDisplayDensityValue(): Float = resources.displayMetrics.density;
+    fun getInsetLeftValue(): Int = currentInsets()[0];
+    fun getInsetTopValue(): Int = currentInsets()[1];
+    fun getInsetRightValue(): Int = currentInsets()[2];
+    fun getInsetBottomValue(): Int = currentInsets()[3];
 
     // Called from native code. The Storage Access Framework returns a content:// URI,
     // which is copied to app cache so the existing C++ file parser can remain unchanged.
     fun openDocumentPicker(): Boolean {
+        Log.i(TAG, "SDRPP_ANDROID15: openDocumentPicker called status=" + documentPickerStatus);
         var stalePath = "";
         synchronized(documentPickerLock) {
             if (documentPickerStatus == DOCUMENT_PICKER_PENDING) {
+                Log.w(TAG, "SDRPP_ANDROID15: document picker already pending");
                 return false;
             }
             if (documentPickerStatus == DOCUMENT_PICKER_SELECTED) {
@@ -130,6 +176,7 @@ class MainActivity : NativeActivity() {
             }
             documentPickerStatus = DOCUMENT_PICKER_PENDING;
             documentPickerResult = "";
+            documentPickerImportedBytes = 0;
         }
 
         if (stalePath.isNotEmpty()) {
@@ -149,9 +196,13 @@ class MainActivity : NativeActivity() {
                     ));
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 }
+                Log.i(TAG, "SDRPP_ANDROID15: starting ACTION_OPEN_DOCUMENT requestCode=" +
+                    DOCUMENT_PICKER_REQUEST + " resolvable=" + (intent.resolveActivity(packageManager) != null));
                 startActivityForResult(intent, DOCUMENT_PICKER_REQUEST);
+                Log.i(TAG, "SDRPP_ANDROID15: startActivityForResult completed");
             }
             catch (e: Exception) {
+                Log.e(TAG, "SDRPP_ANDROID15: document picker start failed", e);
                 setDocumentPickerError("Could not open the Android file picker: " +
                     (e.message ?: e.javaClass.simpleName));
             }
@@ -168,13 +219,18 @@ class MainActivity : NativeActivity() {
     fun consumeDocumentPickerResult(): String {
         synchronized(documentPickerLock) {
             val result = documentPickerResult;
+            Log.i(TAG, "SDRPP_ANDROID15: consumeDocumentPickerResult status=" +
+                documentPickerStatus + " path=" + result + " bytes=" + documentPickerImportedBytes);
             documentPickerStatus = DOCUMENT_PICKER_IDLE;
             documentPickerResult = "";
             return result;
         }
     }
 
+    fun getDocumentPickerImportedBytes(): Long = documentPickerImportedBytes;
+
     private fun setDocumentPickerError(message: String) {
+        Log.e(TAG, "SDRPP_ANDROID15: document picker error=" + message);
         synchronized(documentPickerLock) {
             documentPickerStatus = DOCUMENT_PICKER_ERROR;
             documentPickerResult = message;
@@ -183,12 +239,15 @@ class MainActivity : NativeActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data);
+        Log.i(TAG, "SDRPP_ANDROID15: onActivityResult requestCode=" + requestCode +
+            " resultCode=" + resultCode + " hasData=" + (data != null));
         if (requestCode != DOCUMENT_PICKER_REQUEST) {
             return;
         }
 
         hideSystemBars();
         if (resultCode != RESULT_OK) {
+            Log.i(TAG, "SDRPP_ANDROID15: document picker cancelled resultCode=" + resultCode);
             synchronized(documentPickerLock) {
                 documentPickerStatus = DOCUMENT_PICKER_CANCELLED;
                 documentPickerResult = "";
@@ -202,6 +261,14 @@ class MainActivity : NativeActivity() {
             return;
         }
 
+        val mimeType = try {
+            contentResolver.getType(uri) ?: "unknown";
+        }
+        catch (e: Exception) {
+            "unavailable:" + e.javaClass.simpleName;
+        }
+        Log.i(TAG, "SDRPP_ANDROID15: document selected uri=" + uri + " mime=" + mimeType);
+
         Thread {
             var temporaryFile : File? = null;
             try {
@@ -209,18 +276,25 @@ class MainActivity : NativeActivity() {
                 temporaryFile = targetFile;
                 val input = contentResolver.openInputStream(uri)
                     ?: throw IOException("The selected document could not be opened.");
+                Log.i(TAG, "SDRPP_ANDROID15: openInputStream succeeded");
+                var copiedBytes = 0L;
                 input.use { source ->
                     FileOutputStream(targetFile).use { destination ->
-                        source.copyTo(destination);
+                        copiedBytes = source.copyTo(destination);
                     }
                 }
                 synchronized(documentPickerLock) {
                     documentPickerStatus = DOCUMENT_PICKER_SELECTED;
                     documentPickerResult = targetFile.absolutePath;
+                    documentPickerImportedBytes = copiedBytes;
                 }
+                Log.i(TAG, "SDRPP_ANDROID15: document cached bytes=" + copiedBytes +
+                    " exists=" + targetFile.exists() + " path=" + targetFile.absolutePath);
             }
             catch (e: Exception) {
                 temporaryFile?.delete();
+                documentPickerImportedBytes = 0;
+                Log.e(TAG, "SDRPP_ANDROID15: document copy failed", e);
                 setDocumentPickerError("Could not read the selected document: " +
                     (e.message ?: e.javaClass.simpleName));
             }

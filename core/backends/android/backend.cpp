@@ -6,6 +6,7 @@
 #include "imgui_impl_android.h"
 #include "imgui_impl_opengl3.h"
 #include <android/log.h>
+#include <android/input.h>
 #include <android_native_app_glue.h>
 #include <android/asset_manager.h>
 #include <EGL/egl.h>
@@ -15,7 +16,9 @@
 #include <gui/icons.h>
 #include <gui/style.h>
 #include <gui/menus/theme.h>
+#include <algorithm>
 #include <filesystem>
+#include <mutex>
 
 // Credit to the ImGui android OpenGL3 example for a lot of this code!
 
@@ -35,6 +38,10 @@ namespace backend {
     int PollUnicodeChars();
 
     namespace {
+        std::mutex androidCompatibilityMutex;
+        AndroidCompatibilitySnapshot androidCompatibility;
+        int lastDocumentPickerStatus = -1;
+
         JNIEnv* acquireJavaEnvironment(bool& detachWhenDone) {
             detachWhenDone = false;
             if (!app || !app->activity || !app->activity->vm) { return nullptr; }
@@ -61,6 +68,118 @@ namespace backend {
             env->ExceptionClear();
             return true;
         }
+
+        bool callIntMethod(JNIEnv* env, jclass activityClass, const char* name, int& value) {
+            jmethodID method = env->GetMethodID(activityClass, name, "()I");
+            if (!method || clearJavaException(env)) { return false; }
+            jint result = env->CallIntMethod(app->activity->clazz, method);
+            if (clearJavaException(env)) { return false; }
+            value = result;
+            return true;
+        }
+
+        bool callFloatMethod(JNIEnv* env, jclass activityClass, const char* name, float& value) {
+            jmethodID method = env->GetMethodID(activityClass, name, "()F");
+            if (!method || clearJavaException(env)) { return false; }
+            jfloat result = env->CallFloatMethod(app->activity->clazz, method);
+            if (clearJavaException(env)) { return false; }
+            value = result;
+            return true;
+        }
+
+        bool callStringMethod(JNIEnv* env, jclass activityClass, const char* name, std::string& value) {
+            jmethodID method = env->GetMethodID(activityClass, name, "()Ljava/lang/String;");
+            if (!method || clearJavaException(env)) { return false; }
+            jstring result = (jstring)env->CallObjectMethod(app->activity->clazz, method);
+            if (!result || clearJavaException(env)) { return false; }
+            const char* chars = env->GetStringUTFChars(result, nullptr);
+            if (!chars || clearJavaException(env)) {
+                env->DeleteLocalRef(result);
+                return false;
+            }
+            value = chars;
+            env->ReleaseStringUTFChars(result, chars);
+            env->DeleteLocalRef(result);
+            return true;
+        }
+
+        const char* documentPickerStatusName(AndroidDocumentPickerStatus status) {
+            switch (status) {
+            case AndroidDocumentPickerStatus::IDLE: return "idle";
+            case AndroidDocumentPickerStatus::PENDING: return "pending";
+            case AndroidDocumentPickerStatus::SELECTED: return "selected";
+            case AndroidDocumentPickerStatus::CANCELLED: return "cancelled";
+            case AndroidDocumentPickerStatus::ERROR: return "error";
+            }
+            return "invalid";
+        }
+    }
+
+    void refreshAndroidCompatibilityInfo() {
+        bool detachWhenDone = false;
+        JNIEnv* env = acquireJavaEnvironment(detachWhenDone);
+        if (!env) { return; }
+
+        AndroidCompatibilitySnapshot updated;
+        {
+            std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+            updated = androidCompatibility;
+        }
+
+        jclass activityClass = env->GetObjectClass(app->activity->clazz);
+        if (activityClass) {
+            callIntMethod(env, activityClass, "getAndroidSdkInt", updated.sdkInt);
+            callIntMethod(env, activityClass, "getTargetSdkVersionValue", updated.targetSdk);
+            callStringMethod(env, activityClass, "getAndroidReleaseValue", updated.androidRelease);
+            callIntMethod(env, activityClass, "getDisplayWidthValue", updated.displayWidth);
+            callIntMethod(env, activityClass, "getDisplayHeightValue", updated.displayHeight);
+            callFloatMethod(env, activityClass, "getDisplayDensityValue", updated.density);
+            callIntMethod(env, activityClass, "getInsetLeftValue", updated.insetLeft);
+            callIntMethod(env, activityClass, "getInsetTopValue", updated.insetTop);
+            callIntMethod(env, activityClass, "getInsetRightValue", updated.insetRight);
+            callIntMethod(env, activityClass, "getInsetBottomValue", updated.insetBottom);
+            env->DeleteLocalRef(activityClass);
+        }
+        clearJavaException(env);
+        releaseJavaEnvironment(detachWhenDone);
+
+        std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+        androidCompatibility = updated;
+    }
+
+    AndroidCompatibilitySnapshot getAndroidCompatibilitySnapshot() {
+        std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+        return androidCompatibility;
+    }
+
+    void setAndroidCompatibilityControl(const std::string& control) {
+        std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+        androidCompatibility.lastActivatedControl = control;
+    }
+
+    void setAndroidModulationDiagnostic(const std::string& requested, const std::string& active) {
+        std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+        androidCompatibility.requestedModulation = requested;
+        androidCompatibility.activeModulation = active;
+    }
+
+    void setAndroidVolumeDiagnostic(float guiVolume, float dspVolumeGain) {
+        std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+        androidCompatibility.guiVolume = guiVolume;
+        androidCompatibility.dspVolumeGain = dspVolumeGain;
+    }
+
+    void setAndroidAudioBackendDiagnostic(const std::string& backendName, int result) {
+        std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+        androidCompatibility.audioBackend = backendName;
+        androidCompatibility.audioBackendResult = result;
+    }
+
+    void setAndroidDocumentPickerDiagnostic(const std::string& status, std::uint64_t importedBytes, const std::string& error) {
+        std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+        androidCompatibility.documentPickerStatus = status;
+        androidCompatibility.importedByteCount = importedBytes;
+        androidCompatibility.lastImportError = error;
     }
 
     void doPartialInit() {
@@ -93,14 +212,45 @@ namespace backend {
             break;
         case APP_CMD_GAINED_FOCUS:
             flog::warn("APP_CMD_GAINED_FOCUS");
+            if (ImGui::GetCurrentContext()) { ImGui::GetIO().AddFocusEvent(true); }
+            refreshAndroidCompatibilityInfo();
             break;
         case APP_CMD_LOST_FOCUS:
             flog::warn("APP_CMD_LOST_FOCUS");
+            if (ImGui::GetCurrentContext()) {
+                ImGui::GetIO().AddMouseButtonEvent(0, false);
+                ImGui::GetIO().AddFocusEvent(false);
+            }
             break;
         }
     }
 
     int32_t handleInputEvent(struct android_app* app, AInputEvent* inputEvent) {
+        if (AInputEvent_getType(inputEvent) == AINPUT_EVENT_TYPE_MOTION) {
+            int32_t rawAction = AMotionEvent_getAction(inputEvent);
+            int32_t action = rawAction & AMOTION_EVENT_ACTION_MASK;
+            std::size_t pointerCount = AMotionEvent_getPointerCount(inputEvent);
+            std::size_t pointerIndex = (rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+            float x = -1.0f;
+            float y = -1.0f;
+            if (pointerCount > 0) {
+                pointerIndex = std::min(pointerIndex, pointerCount - 1);
+                x = AMotionEvent_getX(inputEvent, pointerIndex);
+                y = AMotionEvent_getY(inputEvent, pointerIndex);
+            }
+            {
+                std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+                androidCompatibility.lastTouchX = x;
+                androidCompatibility.lastTouchY = y;
+                androidCompatibility.lastTouchAction = action;
+            }
+            if (action == AMOTION_EVENT_ACTION_DOWN) {
+                flog::info("SDRPP_ANDROID15: touch down x={0:.1f} y={1:.1f} pointers={2}", x, y, pointerCount);
+            }
+            else if (action == AMOTION_EVENT_ACTION_CANCEL) {
+                flog::info("SDRPP_ANDROID15: touch cancelled x={0:.1f} y={1:.1f}", x, y);
+            }
+        }
         return ImGui_ImplAndroid_HandleInputEvent(inputEvent);
     }
 
@@ -177,6 +327,13 @@ namespace backend {
         ImGui_ImplAndroid_Init(app->window);
         ImGui_ImplOpenGL3_Init("#version 300 es");
 
+        refreshAndroidCompatibilityInfo();
+        AndroidCompatibilitySnapshot compatibility = getAndroidCompatibilitySnapshot();
+        flog::info("SDRPP_ANDROID15: native startup api={0} release={1} targetSdk={2} display={3}x{4} density={5:.2f} insets={6},{7},{8},{9}",
+            compatibility.sdkInt, compatibility.androidRelease, compatibility.targetSdk,
+            compatibility.displayWidth, compatibility.displayHeight, compatibility.density,
+            compatibility.insetLeft, compatibility.insetTop, compatibility.insetRight, compatibility.insetBottom);
+
         return 0;
     }
 
@@ -184,6 +341,19 @@ namespace backend {
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplAndroid_NewFrame();
+        int drawableWidth = 0;
+        int drawableHeight = 0;
+        if (_EglDisplay != EGL_NO_DISPLAY && _EglSurface != EGL_NO_SURFACE) {
+            eglQuerySurface(_EglDisplay, _EglSurface, EGL_WIDTH, &drawableWidth);
+            eglQuerySurface(_EglDisplay, _EglSurface, EGL_HEIGHT, &drawableHeight);
+        }
+        {
+            std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+            androidCompatibility.inputSurfaceWidth = app && app->window ? ANativeWindow_getWidth(app->window) : 0;
+            androidCompatibility.inputSurfaceHeight = app && app->window ? ANativeWindow_getHeight(app->window) : 0;
+            androidCompatibility.drawableWidth = drawableWidth;
+            androidCompatibility.drawableHeight = drawableHeight;
+        }
         ImGui::NewFrame();
     }
 
@@ -391,9 +561,13 @@ namespace backend {
     }
 
     bool openDocumentPicker() {
+        flog::info("SDRPP_ANDROID15: native openDocumentPicker JNI request");
         bool detachWhenDone = false;
         JNIEnv* env = acquireJavaEnvironment(detachWhenDone);
-        if (!env) { return false; }
+        if (!env) {
+            setAndroidDocumentPickerDiagnostic("JNI environment unavailable", 0, "Could not acquire JNI environment");
+            return false;
+        }
 
         bool opened = false;
         jclass activityClass = env->GetObjectClass(app->activity->clazz);
@@ -407,6 +581,10 @@ namespace backend {
 
         if (clearJavaException(env)) { opened = false; }
         releaseJavaEnvironment(detachWhenDone);
+        flog::info("SDRPP_ANDROID15: native openDocumentPicker returned {0}", opened);
+        if (!opened) {
+            setAndroidDocumentPickerDiagnostic("picker start failed", 0, "Kotlin openDocumentPicker returned false");
+        }
         return opened;
     }
 
@@ -434,7 +612,37 @@ namespace backend {
             status > (jint)AndroidDocumentPickerStatus::ERROR) {
             return AndroidDocumentPickerStatus::ERROR;
         }
-        return (AndroidDocumentPickerStatus)status;
+        AndroidDocumentPickerStatus pickerStatus = (AndroidDocumentPickerStatus)status;
+        bool statusChanged = false;
+        {
+            std::lock_guard<std::mutex> lock(androidCompatibilityMutex);
+            statusChanged = lastDocumentPickerStatus != status;
+            lastDocumentPickerStatus = status;
+            androidCompatibility.documentPickerStatus = documentPickerStatusName(pickerStatus);
+        }
+        if (statusChanged) {
+            flog::info("SDRPP_ANDROID15: native document picker status={0}", documentPickerStatusName(pickerStatus));
+        }
+        return pickerStatus;
+    }
+
+    std::uint64_t getDocumentPickerImportedBytes() {
+        bool detachWhenDone = false;
+        JNIEnv* env = acquireJavaEnvironment(detachWhenDone);
+        if (!env) { return 0; }
+
+        jlong importedBytes = 0;
+        jclass activityClass = env->GetObjectClass(app->activity->clazz);
+        if (activityClass) {
+            jmethodID method = env->GetMethodID(activityClass, "getDocumentPickerImportedBytes", "()J");
+            if (method) {
+                importedBytes = env->CallLongMethod(app->activity->clazz, method);
+            }
+            env->DeleteLocalRef(activityClass);
+        }
+        if (clearJavaException(env)) { importedBytes = 0; }
+        releaseJavaEnvironment(detachWhenDone);
+        return importedBytes > 0 ? (std::uint64_t)importedBytes : 0;
     }
 
     std::string consumeDocumentPickerResult() {
@@ -462,6 +670,7 @@ namespace backend {
 
         if (clearJavaException(env)) { result.clear(); }
         releaseJavaEnvironment(detachWhenDone);
+        flog::info("SDRPP_ANDROID15: native consumed document picker result path='{0}'", result);
         return result;
     }
 

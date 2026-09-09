@@ -25,6 +25,10 @@ struct DisabledScope {
 #include "demod.h"
 #include <gui/widgets/precision_slider.h>
 
+#ifdef __ANDROID__
+#include <android_backend.h>
+#endif
+
 ConfigManager config;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -172,6 +176,12 @@ public:
     };
 
 private:
+    static const char* demodName(DemodID id) {
+        static const char* names[] = { "NFM", "WFM", "AM", "DSB", "USB", "CW", "LSB", "RAW" };
+        int index = (int)id;
+        return (index >= 0 && index < _RADIO_DEMOD_COUNT) ? names[index] : "invalid";
+    }
+
     static void menuHandler(void* ctx) {
         RadioModule* _this = (RadioModule*)ctx;
         
@@ -195,7 +205,17 @@ private:
             _this->selectDemodByID(RADIO_DEMOD_WFM);
         }
         ImGui::NextColumn();
-        if (ImGui::RadioButton(CONCAT("AM##_", _this->name), _this->selectedDemodID == 2) && _this->selectedDemodID != 2) {
+        bool amActivated = ImGui::RadioButton(CONCAT("AM##_", _this->name), _this->selectedDemodID == 2);
+#ifdef __ANDROID__
+        if (ImGui::IsItemActivated()) {
+            backend::setAndroidCompatibilityControl("AM radio button");
+            flog::info("SDRPP_ANDROID15: AM ImGui item activated mode_before={0}", demodName((DemodID)_this->selectedDemodID));
+        }
+        if (amActivated) {
+            flog::info("SDRPP_ANDROID15: AM radio button activation returned true mode_before={0}", demodName((DemodID)_this->selectedDemodID));
+        }
+#endif
+        if (amActivated && _this->selectedDemodID != 2) {
             _this->selectDemodByID(RADIO_DEMOD_AM);
         }
         if (ImGui::RadioButton(CONCAT("DSB##_", _this->name), _this->selectedDemodID == 3) && _this->selectedDemodID != 3) {
@@ -354,13 +374,25 @@ private:
 
     void selectDemodByID(DemodID id) {
         auto startTime = std::chrono::high_resolution_clock::now();
+        DemodID previousDemod = (DemodID)selectedDemodID;
+#ifdef __ANDROID__
+        backend::setAndroidModulationDiagnostic(demodName(id), demodName(previousDemod));
+        flog::info("SDRPP_ANDROID15: modulation request requested={0} before={1}", demodName(id), demodName(previousDemod));
+#endif
         demod::Demodulator* demod = instantiateDemod(id);
         if (!demod) {
             flog::error("Demodulator {0} not implemented", (int)id);
+#ifdef __ANDROID__
+            backend::setAndroidModulationDiagnostic(demodName(id), demodName(previousDemod));
+#endif
             return;
         }
         selectedDemodID = id;
         selectDemod(demod);
+#ifdef __ANDROID__
+        backend::setAndroidModulationDiagnostic(demodName(id), demodName((DemodID)selectedDemodID));
+        flog::info("SDRPP_ANDROID15: modulation applied requested={0} after={1}", demodName(id), demodName((DemodID)selectedDemodID));
+#endif
 
         // Save config
         config.acquire();

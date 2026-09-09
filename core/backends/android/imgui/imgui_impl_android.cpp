@@ -211,6 +211,12 @@ int32_t ImGui_ImplAndroid_HandleInputEvent(AInputEvent* input_event)
                 io.AddMouseButtonEvent(0, event_action == AMOTION_EVENT_ACTION_DOWN);
             }
             break;
+        case AMOTION_EVENT_ACTION_CANCEL:
+            // Android can cancel a gesture without sending ACTION_UP (for example when
+            // system navigation or another activity takes ownership). Always release
+            // the synthetic ImGui mouse button so subsequent controls remain usable.
+            io.AddMouseButtonEvent(0, false);
+            break;
         case AMOTION_EVENT_ACTION_BUTTON_PRESS:
         case AMOTION_EVENT_ACTION_BUTTON_RELEASE:
             {

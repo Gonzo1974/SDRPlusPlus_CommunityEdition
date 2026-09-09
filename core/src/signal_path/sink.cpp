@@ -6,6 +6,10 @@
 
 #include <core.h>
 
+#ifdef __ANDROID__
+#include <android_backend.h>
+#endif
+
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 SinkManager::SinkManager() {
@@ -270,6 +274,10 @@ void SinkManager::showVolumeSlider(std::string name, std::string prefix, float w
     if (stream->volumeAjust.getMuted()) {
         ImGui::PushID(ImGui::GetID(("sdrpp_unmute_btn_" + name).c_str()));
         if (ImGui::ImageButton(icons::MUTED, ImVec2(height, height), ImVec2(0, 0), ImVec2(1, 1), btnBorder, ImVec4(0, 0, 0, 0), ImGui::GetStyleColorVec4(ImGuiCol_Text))) {
+#ifdef __ANDROID__
+            backend::setAndroidCompatibilityControl("Volume unmute button");
+            flog::info("SDRPP_ANDROID15: volume unmute button activated stream='{0}'", name);
+#endif
             stream->volumeAjust.setMuted(false);
             core::configManager.acquire();
             saveStreamConfig(name);
@@ -280,6 +288,10 @@ void SinkManager::showVolumeSlider(std::string name, std::string prefix, float w
     else {
         ImGui::PushID(ImGui::GetID(("sdrpp_mute_btn_" + name).c_str()));
         if (ImGui::ImageButton(icons::UNMUTED, ImVec2(height, height), ImVec2(0, 0), ImVec2(1, 1), btnBorder, ImVec4(0, 0, 0, 0), ImGui::GetStyleColorVec4(ImGuiCol_Text))) {
+#ifdef __ANDROID__
+            backend::setAndroidCompatibilityControl("Volume mute button");
+            flog::info("SDRPP_ANDROID15: volume mute button activated stream='{0}'", name);
+#endif
             stream->volumeAjust.setMuted(true);
             core::configManager.acquire();
             saveStreamConfig(name);
@@ -292,12 +304,29 @@ void SinkManager::showVolumeSlider(std::string name, std::string prefix, float w
 
     ImGui::SetNextItemWidth(width - height - sliderOffset);
     ImGui::SetCursorPosY(ypos + ((height - sliderHeight) / 2.0f) + btnBorder);
+    float previousGuiVolume = stream->guiVolume;
     if (ImGui::SliderFloat((prefix + name).c_str(), &stream->guiVolume, 0.0f, 1.0f, "")) {
         stream->setVolume(stream->guiVolume);
+#ifdef __ANDROID__
+        float dspGain = stream->guiVolume * stream->guiVolume;
+        backend::setAndroidVolumeDiagnostic(stream->guiVolume, dspGain);
+        flog::info("SDRPP_ANDROID15: volume changed stream='{0}' gui_before={1:.3f} gui_after={2:.3f} dsp_gain={3:.3f} backend=AAudio-pre-DSP",
+            name, previousGuiVolume, stream->guiVolume, dspGain);
+#endif
         core::configManager.acquire();
         saveStreamConfig(name);
         core::configManager.release(true);
     }
+#ifdef __ANDROID__
+    if (ImGui::IsItemActivated()) {
+        backend::setAndroidCompatibilityControl("Volume slider");
+        backend::setAndroidVolumeDiagnostic(stream->guiVolume, stream->guiVolume * stream->guiVolume);
+        flog::info("SDRPP_ANDROID15: volume slider activated stream='{0}' gui={1:.3f}", name, stream->guiVolume);
+    }
+    else {
+        backend::setAndroidVolumeDiagnostic(stream->guiVolume, stream->guiVolume * stream->guiVolume);
+    }
+#endif
     if (sameLine) { ImGui::SetCursorPosY(ypos); }
     //ImGui::SetCursorPosY(ypos);
 }

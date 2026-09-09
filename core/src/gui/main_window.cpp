@@ -28,6 +28,10 @@
 #include <gui/widgets/snr_meter.h>
 #include <gui/tuner.h>
 
+#ifdef __ANDROID__
+#include <android_backend.h>
+#endif
+
 void MainWindow::init() {
     LoadingScreen::show("Initializing UI");
     gui::waterfall.init();
@@ -672,6 +676,36 @@ void MainWindow::draw() {
             ImGui::Text("Source name: %s", sourceName.c_str());
             ImGui::Checkbox("Show demo window", &demoWindow);
             ImGui::Text("ImGui version: %s", ImGui::GetVersion());
+
+#ifdef __ANDROID__
+            if (ImGui::TreeNode("Android Compatibility")) {
+                backend::AndroidCompatibilitySnapshot compatibility = backend::getAndroidCompatibilitySnapshot();
+                ImGui::Text("Android API: %d (%s)", compatibility.sdkInt, compatibility.androidRelease.c_str());
+                ImGui::Text("Target SDK: %d", compatibility.targetSdk);
+                ImGui::Text("Display: %dx%d density %.2f", compatibility.displayWidth,
+                    compatibility.displayHeight, compatibility.density);
+                ImGui::Text("Input surface: %dx%d", compatibility.inputSurfaceWidth,
+                    compatibility.inputSurfaceHeight);
+                ImGui::Text("EGL drawable: %dx%d", compatibility.drawableWidth,
+                    compatibility.drawableHeight);
+                ImGui::Text("Insets L/T/R/B: %d / %d / %d / %d", compatibility.insetLeft,
+                    compatibility.insetTop, compatibility.insetRight, compatibility.insetBottom);
+                ImGui::Text("Last touch: %.1f / %.1f (action %d)", compatibility.lastTouchX,
+                    compatibility.lastTouchY, compatibility.lastTouchAction);
+                ImGui::TextWrapped("Last activated UI control: %s", compatibility.lastActivatedControl.c_str());
+                ImGui::Text("Requested modulation: %s", compatibility.requestedModulation.c_str());
+                ImGui::Text("Active modulation: %s", compatibility.activeModulation.c_str());
+                ImGui::Text("GUI volume: %.3f", compatibility.guiVolume);
+                ImGui::Text("DSP volume gain: %.3f", compatibility.dspVolumeGain);
+                ImGui::TextWrapped("Audio backend: %s (last result %d)", compatibility.audioBackend.c_str(),
+                    compatibility.audioBackendResult);
+                ImGui::Text("Document picker status: %s", compatibility.documentPickerStatus.c_str());
+                ImGui::Text("Imported byte count: %llu", (unsigned long long)compatibility.importedByteCount);
+                ImGui::TextWrapped("Last import error: %s", compatibility.lastImportError.empty()
+                    ? "none" : compatibility.lastImportError.c_str());
+                ImGui::TreePop();
+            }
+#endif
 
             // ImGui::Checkbox("Bypass buffering", &sigpath::iqFrontEnd.inputBuffer.bypass);
 

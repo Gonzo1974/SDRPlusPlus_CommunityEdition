@@ -9,6 +9,7 @@
 #include <utils/optionlist.h>
 #include <aaudio/AAudio.h>
 #include <core.h>
+#include <android_backend.h>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -33,6 +34,8 @@ public:
         // TODO: Add choice? I don't think anyone cares on android...
         sampleRate = 48000;
         _stream->setSampleRate(sampleRate);
+        backend::setAndroidAudioBackendDiagnostic("AAudio", AAUDIO_OK);
+        flog::info("SDRPP_ANDROID15: selected Android audio backend=AAudio sample_rate={0}", sampleRate);
     }
 
     ~AudioSink() {
@@ -59,10 +62,22 @@ public:
     }
 
 private:
+    void reportAAudioResult(const char* operation, aaudio_result_t result) {
+        backend::setAndroidAudioBackendDiagnostic("AAudio", result);
+        if (result == AAUDIO_OK) {
+            flog::info("SDRPP_ANDROID15: AAudio {0} result={1}", operation, result);
+        }
+        else {
+            flog::error("SDRPP_ANDROID15: AAudio {0} failed result={1} ({2})", operation,
+                result, AAudio_convertResultToText(result));
+        }
+    }
+
     void doStart() {
         // Create stream builder
         AAudioStreamBuilder *builder;
         aaudio_result_t result = AAudio_createStreamBuilder(&builder);
+        reportAAudioResult("create builder", result);
 
         // Set stream options
         bufferSize = round(sampleRate / 60.0);
@@ -76,11 +91,13 @@ private:
         packer.setSampleCount(bufferSize);
         
         // Open the stream
-        AAudioStreamBuilder_openStream(builder, &stream);
+        result = AAudioStreamBuilder_openStream(builder, &stream);
+        reportAAudioResult("open stream", result);
 
         // Stream stream and packer
         packer.start();
-        AAudioStream_requestStart(stream);
+        result = AAudioStream_requestStart(stream);
+        reportAAudioResult("request start", result);
 
         // We no longer need the builder
         AAudioStreamBuilder_delete(builder);
@@ -92,8 +109,8 @@ private:
     void doStop() {
         packer.stop();
         packer.out.stopReader();
-        AAudioStream_requestStop(stream);
-        AAudioStream_close(stream);
+        reportAAudioResult("request stop", AAudioStream_requestStop(stream));
+        reportAAudioResult("close stream", AAudioStream_close(stream));
         if (workerThread.joinable()) { workerThread.join(); }
         packer.out.clearReadStop();
     }
@@ -102,15 +119,20 @@ private:
         while (true) {
             int count = packer.out.read();
             if (count < 0) { return; }
-            AAudioStream_write(stream, packer.out.readBuf, count, 100000000);
+            aaudio_result_t written = AAudioStream_write(stream, packer.out.readBuf, count, 100000000);
+            if (written < 0) {
+                reportAAudioResult("write", written);
+            }
             packer.out.flush();
         }
     }
 
     static void errorCallback(AAudioStream *stream, void *userData, aaudio_result_t error){
+        AudioSink* sink = (AudioSink*)userData;
+        sink->reportAAudioResult("error callback", error);
         // detect an audio device detached and restart the stream
         if (error == AAUDIO_ERROR_DISCONNECTED){
-            std::thread thr(&AudioSink::restart, (AudioSink*)userData);
+            std::thread thr(&AudioSink::restart, sink);
             thr.detach();
         }
     }
